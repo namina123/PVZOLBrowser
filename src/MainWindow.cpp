@@ -1,13 +1,21 @@
 #include "MainWindow.h"
 
 #include "BrowserTab.h"
+#include "network/ProxyManager.h"
 
 #include <QAction>
+#include <QComboBox>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QLineEdit>
+#include <QSignalBlocker>
 #include <QSize>
 #include <QTabWidget>
+#include <QToolButton>
 #include <QToolBar>
 #include <QUrl>
+#include <QVBoxLayout>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -51,7 +59,52 @@ void MainWindow::buildUi()
     m_addressBar->setPlaceholderText(tr("\u8f93\u5165\u7f51\u5740\uff0c\u4f8b\u5982 http://www.baidu.com"));
     toolbar->addWidget(m_addressBar);
 
+    m_proxyButton = new QToolButton(this);
+    m_proxyButton->setObjectName(QStringLiteral("proxyEntryButton"));
+    m_proxyButton->setText(tr("\u4ee3\u7406"));
+    toolbar->addWidget(m_proxyButton);
+
+    m_proxyPopup = new QFrame(this, Qt::Popup | Qt::FramelessWindowHint);
+    m_proxyPopup->setObjectName(QStringLiteral("proxyPopup"));
+    m_proxyPopup->setMinimumWidth(320);
+    auto *popupLayout = new QVBoxLayout(m_proxyPopup);
+    popupLayout->setContentsMargins(16, 16, 16, 16);
+    popupLayout->setSpacing(10);
+
+    auto *popupTitle = new QLabel(tr("\u7f51\u7edc\u4ee3\u7406"), m_proxyPopup);
+    popupTitle->setObjectName(QStringLiteral("proxyPopupTitle"));
+    popupLayout->addWidget(popupTitle);
+
+    m_proxyModeBox = new QComboBox(m_proxyPopup);
+    m_proxyModeBox->setObjectName(QStringLiteral("proxyModeBox"));
+    m_proxyModeBox->addItem(tr("\u7cfb\u7edf\u4ee3\u7406"));
+    m_proxyModeBox->addItem(tr("\u56fa\u5b9a\u4ee3\u7406"));
+    popupLayout->addWidget(m_proxyModeBox);
+
+    m_proxyInput = new QLineEdit(m_proxyPopup);
+    m_proxyInput->setObjectName(QStringLiteral("proxyInput"));
+    m_proxyInput->setClearButtonEnabled(true);
+    m_proxyInput->setPlaceholderText(tr("\u4f8b\u5982 127.0.0.1:7890 \u6216 http://127.0.0.1:7890"));
+    popupLayout->addWidget(m_proxyInput);
+
+    auto *actionRow = new QHBoxLayout();
+    actionRow->setContentsMargins(0, 2, 0, 0);
+    actionRow->setSpacing(8);
+
+    m_proxyApplyButton = new QToolButton(m_proxyPopup);
+    m_proxyApplyButton->setObjectName(QStringLiteral("proxyApplyButton"));
+    m_proxyApplyButton->setText(tr("\u5e94\u7528\u4ee3\u7406"));
+    actionRow->addWidget(m_proxyApplyButton);
+    actionRow->addStretch(1);
+    popupLayout->addLayout(actionRow);
+
+    m_proxyStatusLabel = new QLabel(m_proxyPopup);
+    m_proxyStatusLabel->setObjectName(QStringLiteral("proxyStatusLabel"));
+    m_proxyStatusLabel->setWordWrap(true);
+    popupLayout->addWidget(m_proxyStatusLabel);
+
     applyVisualStyle();
+    syncProxyUi();
 }
 
 void MainWindow::connectSignals()
@@ -92,6 +145,13 @@ void MainWindow::connectSignals()
     });
     connect(m_newTabAction, &QAction::triggered, this, &MainWindow::openHomeInNewTab);
     connect(m_closeTabAction, &QAction::triggered, this, &MainWindow::closeCurrentTab);
+    connect(m_proxyButton, &QToolButton::clicked, this, &MainWindow::toggleProxyPopup);
+    connect(m_proxyModeBox, &QComboBox::currentIndexChanged, this, [this](int) {
+        syncProxyUi();
+    });
+    connect(m_proxyInput, &QLineEdit::returnPressed, this, &MainWindow::applyProxySelection);
+    connect(m_proxyApplyButton, &QToolButton::clicked, this, &MainWindow::applyProxySelection);
+    connect(&ProxyManager::instance(), &ProxyManager::stateChanged, this, &MainWindow::syncProxyUi);
 }
 
 void MainWindow::applyVisualStyle()
@@ -127,6 +187,10 @@ void MainWindow::applyVisualStyle()
         QToolButton:pressed {
             background: #e6edf6;
         }
+        QToolButton#proxyEntryButton {
+            margin-left: 10px;
+            min-width: 62px;
+        }
         QLineEdit#addressBar {
             min-height: 40px;
             margin-left: 10px;
@@ -140,6 +204,41 @@ void MainWindow::applyVisualStyle()
         }
         QLineEdit#addressBar:focus {
             border: 1px solid #0f766e;
+        }
+        QFrame#proxyPopup {
+            background: rgba(255, 255, 255, 0.98);
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 18px;
+        }
+        QLabel#proxyPopupTitle {
+            color: #0f172a;
+            font-size: 15px;
+            font-weight: 700;
+        }
+        QComboBox#proxyModeBox,
+        QLineEdit#proxyInput {
+            min-height: 38px;
+            padding: 0 12px;
+            background: #ffffff;
+            color: #0f172a;
+            border: 1px solid #cbd5e1;
+            border-radius: 18px;
+            font-size: 13px;
+        }
+        QComboBox#proxyModeBox {
+            min-width: 110px;
+        }
+        QLineEdit#proxyInput {
+            min-width: 260px;
+        }
+        QToolButton#proxyApplyButton {
+            min-width: 88px;
+        }
+        QLabel#proxyStatusLabel {
+            color: #0f766e;
+            font-size: 12px;
+            font-weight: 600;
+            min-width: 220px;
         }
         QTabWidget#browserTabs::pane {
             border: none;
@@ -273,4 +372,57 @@ void MainWindow::refreshTabCaption(BrowserTab *tab, const QString &pageTitle)
 
     const QString title = pageTitle.isEmpty() ? tr("\u65b0\u6807\u7b7e\u9875") : pageTitle;
     m_tabWidget->setTabText(index, title.left(20));
+}
+
+void MainWindow::toggleProxyPopup()
+{
+    if (m_proxyPopup->isVisible()) {
+        m_proxyPopup->hide();
+        return;
+    }
+
+    syncProxyUi();
+    positionProxyPopup();
+    m_proxyPopup->show();
+    m_proxyPopup->raise();
+    if (m_proxyModeBox->currentIndex() == 1) {
+        m_proxyInput->setFocus();
+        m_proxyInput->selectAll();
+    }
+}
+
+void MainWindow::positionProxyPopup() const
+{
+    const QPoint anchor = m_proxyButton->mapToGlobal(QPoint(0, m_proxyButton->height() + 10));
+    m_proxyPopup->move(anchor);
+}
+
+void MainWindow::syncProxyUi()
+{
+    const ProxyManager &proxyManager = ProxyManager::instance();
+    const bool prefersSystemMode = proxyManager.preferredMode() == ProxyManager::Mode::System;
+    const bool activeSystemMode = proxyManager.mode() == ProxyManager::Mode::System;
+    const QSignalBlocker blocker(m_proxyModeBox);
+    m_proxyModeBox->setCurrentIndex(prefersSystemMode ? 0 : 1);
+    if (!proxyManager.manualProxyText().isEmpty()) {
+        m_proxyInput->setText(proxyManager.manualProxyText());
+    }
+    m_proxyInput->setEnabled(!prefersSystemMode);
+    m_proxyApplyButton->setEnabled(prefersSystemMode || !m_proxyInput->text().trimmed().isEmpty());
+    m_proxyStatusLabel->setText(proxyManager.statusText());
+    m_proxyButton->setToolTip(proxyManager.statusText());
+    m_proxyButton->setText(activeSystemMode
+        ? tr("\u4ee3\u7406")
+        : tr("\u4ee3\u7406*"));
+}
+
+void MainWindow::applyProxySelection()
+{
+    if (m_proxyModeBox->currentIndex() == 0) {
+        ProxyManager::instance().useSystemProxy();
+        m_proxyPopup->hide();
+        return;
+    }
+
+    ProxyManager::instance().applyFixedProxy(m_proxyInput->text());
 }

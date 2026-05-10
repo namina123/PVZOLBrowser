@@ -2,6 +2,8 @@
 
 #include "IBrowserBackend.h"
 
+class RuffleProxyServer;
+class QWebEngineProfile;
 class QWebEngineView;
 class QWidget;
 
@@ -24,5 +26,10 @@ public:
     QString currentTitle() const override;
 
 private:
+    void updateCurrentUrl(const QUrl &url);
+
+    RuffleProxyServer *m_proxyServer = nullptr;
+    QWebEngineProfile *m_profile = nullptr;
     QWebEngineView *m_webView = nullptr;
+    QUrl m_currentUrl;
 };

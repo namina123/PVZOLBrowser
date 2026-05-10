@@ -5,9 +5,13 @@
 #include <QUrl>
 
 class BrowserTab;
+class QComboBox;
+class QFrame;
+class QLabel;
 class QLineEdit;
 class QTabWidget;
 class QAction;
+class QToolButton;
 
 class MainWindow : public QMainWindow
 {
@@ -28,9 +32,19 @@ private:
     void closeCurrentTab();
     void openHomeInNewTab();
     void refreshTabCaption(BrowserTab *tab, const QString &pageTitle);
+    void toggleProxyPopup();
+    void positionProxyPopup() const;
+    void syncProxyUi();
+    void applyProxySelection();
 
     QTabWidget *m_tabWidget = nullptr;
     QLineEdit *m_addressBar = nullptr;
+    QToolButton *m_proxyButton = nullptr;
+    QFrame *m_proxyPopup = nullptr;
+    QComboBox *m_proxyModeBox = nullptr;
+    QLineEdit *m_proxyInput = nullptr;
+    QToolButton *m_proxyApplyButton = nullptr;
+    QLabel *m_proxyStatusLabel = nullptr;
     QAction *m_backAction = nullptr;
     QAction *m_forwardAction = nullptr;
     QAction *m_reloadAction = nullptr;

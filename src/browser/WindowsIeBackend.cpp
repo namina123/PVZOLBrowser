@@ -174,14 +174,6 @@ void WindowsIeBackend::handleAxEvent(const QString &name, int argc, void *argv)
         if (cancel != nullptr) {
             *cancel = VARIANT_TRUE;
         }
-
-        const QString rawUrl = params[0].bstrVal != nullptr
-            ? QString::fromWCharArray(params[0].bstrVal)
-            : QString();
-        const QUrl targetUrl = QUrl::fromUserInput(rawUrl);
-        if (isAllowedUrl(targetUrl)) {
-            loadUrl(targetUrl);
-        }
         return;
     }
 

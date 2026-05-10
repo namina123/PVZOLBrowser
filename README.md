@@ -1,135 +1,119 @@
 # PVZOLBrowser
 
-一个基于 Qt Widgets 的跨平台浏览器项目：
+基于 Qt / C++ 的个人跨平台浏览器项目，当前重点是兼容 Flash / SWF 页面访问。
 
-- Windows 使用 IE 内核：`QAxWidget + Shell.Explorer`
-- Linux / macOS 使用 Chromium 内核：`QWebEngineView`
-- 默认主页：`http://www.baidu.com`
-- 当前工程按 Qt 动态链接方式组织，便于遵守 LGPLv3 的使用边界
+## 当前行为
 
-## 当前状态
-
-当前版本已经具备这些基础能力：
-
-- 单窗口多标签页浏览
-- 地址栏输入并回车跳转
-- 后退、前进、刷新、首页
-- 顶部页面加载进度条
-- Windows / Linux / macOS 按平台切换浏览器内核
-- 默认中文界面，并保留 `tr()` 形式，后续可继续扩展 i18n
-
-Windows 上已经完成一次实际编译和启动验证。
-
-## 初期架构
-
-为了避免后期功能增长后出现严重耦合，当前结构拆成了几层：
-
-- `MainWindow`
-  负责窗口、工具栏、标签页管理和整体视觉样式
-- `BrowserTab`
-  负责单个标签页会话和页面加载进度
-- `BrowserView`
-  负责把统一浏览器接口挂接到界面容器
-- `IBrowserBackend`
-  负责定义跨平台统一浏览器后端接口
-- `WindowsIeBackend / WebEngineBackend`
-  负责各平台浏览器内核实现
-
-这样后续继续加下载、脚本注入、Cookie、代理、历史记录时，能够尽量沿职责边界扩展，而不是把所有逻辑堆进主窗口。
-
-## 目录结构
-
-```text
-PVZOLBrowser/
-  CMakeLists.txt
-  README.md
-  .gitignore
-  src/
-    main.cpp
-    MainWindow.h
-    MainWindow.cpp
-    BrowserTab.h
-    BrowserTab.cpp
-    BrowserView.h
-    BrowserView.cpp
-    browser/
-      BrowserConfig.h
-      IBrowserBackend.h
-      BrowserBackendFactory.h
-      BrowserBackendFactory.cpp
-      WindowsIeBackend.h
-      WindowsIeBackend.cpp
-      WebEngineBackend.h
-      WebEngineBackend.cpp
-```
-
-## LGPLv3 与动态链接约束
-
-这是个人项目，但如果你基于 Qt 的 LGPLv3 版本来分发程序，建议至少保持这些原则：
-
-- 只使用 Qt 动态链接库，不静态链接 Qt
-- 分发程序时同时附带 Qt 的 LGPLv3 许可证文本
-- 不阻止用户替换程序依赖的 Qt 动态库
-- 如果修改了 Qt 库本身，分发时需要提供对应修改
-
-当前工程侧已经采取这些策略：
-
-- `CMakeLists.txt` 正常链接 Qt 动态模块
-- Windows 上显式使用 `/MD` 运行时
-- 仓库不提交 Qt SDK 和构建产物
-
-## 依赖
+- 默认主页为 `http://www.baidu.com`
+- 界面默认中文
+- 禁用浏览器内弹窗
+- 尽量阻止页面把外部 URL 转交给系统其他浏览器
+- 提供运行时代理切换：
+  - 系统代理模式：跟随 Windows / Qt 系统代理
+  - 固定代理模式：先用 `http://www.baidu.com` 测试代理可用，再启用；失败则回退系统代理
+  - 代理记忆配置写入可执行文件同级的外部目录 `PVZOLBrowserData/settings.ini`
 
 ### Windows
 
-需要这些组件：
-
-- Qt 6
-- Qt Widgets
-- ActiveQt / AxContainer
-- CMake
-- MSVC 或 MinGW 工具链
-
-说明：
-
-- Windows 分支依赖系统自带的 `Shell.Explorer`
-- 程序启动时会写入 `FEATURE_BROWSER_EMULATION=11001`，尽量让嵌入式 IE 以内核高版本模式运行
+- 若系统环境中存在原生 Flash ActiveX，则使用 `IE + Flash` 路径渲染
+- 若未检测到原生 Flash，则回退到 `Qt WebEngine + Ruffle`
 
 ### Linux / macOS
 
-需要这些组件：
+- 使用 `Qt WebEngine + Ruffle`
 
-- Qt 6
-- Qt Widgets
-- Qt WebEngineWidgets
-- CMake
-- 平台对应的 C++ 编译器
+### Ruffle 方案
 
-## 构建
+- `assets/ruffle` 直接来自参考项目 `C:\projects\references\Flash-Browser-Android-master`
+- HTML 页面会注入与参考项目一致风格的 Ruffle 配置脚本与 `bootstrap.js`
+- 直接打开 `.swf` 地址时，会进入内置的 Ruffle 播放页
+- 页面中嵌入式 `.swf` 资源仍走原始 SWF 数据代理，避免破坏页面内的 Flash 加载流程
+
+## 架构
+
+当前刻意做了初期解耦，避免后续下载、脚本注入、代理、历史记录等功能直接耦合进主窗口。
+
+- `MainWindow`
+  负责窗口、工具栏、标签页和整体视觉层
+- `BrowserTab`
+  负责单标签状态和加载进度
+- `BrowserView`
+  负责界面容器与浏览器后端对接
+- `IBrowserBackend`
+  定义统一浏览器后端接口
+- `WindowsIeBackend`
+  负责 Windows 下的 IE/ActiveX 路径
+- `WebEngineBackend`
+  负责 Chromium 内核路径
+- `RuffleProxyServer`
+  负责本地代理、Ruffle 资源分发、HTML 注入、SWF 播放页
+- `FlashRuntime`
+  负责运行时判断是否存在原生 Flash 支持
+- `ProxyManager`
+  负责全局代理模式切换、固定代理连通性检测与 Qt 网络代理应用
+
+## LGPLv3 约束
+
+本项目按“仅动态链接 Qt”来组织，便于遵守 LGPLv3。
+
+- `CMakeLists.txt` 仅链接 Qt 动态库
+- Windows 运行时使用 `/MD`
+- 仓库不内置 Qt 源码改动
+- 分发时应一并附带 Qt 对应许可证文本，并保留用户替换 Qt 动态库的能力
+
+## 本地构建
 
 ### Windows
 
-如果已安装 Qt 并能被 CMake 找到，可执行：
+当前已在 Windows 上实际完成一次编译与启动烟雾验证。
 
 ```powershell
-cmake -S . -B build -DCMAKE_PREFIX_PATH="C:\path\to\Qt\6.x.x\msvc2022_64"
-cmake --build build --config Release
+cmake -S . -B build-msvc -G "NMake Makefiles" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="C:\path\to\Qt\6.x.x\msvc2022_64"
+
+cmake --build build-msvc --config Release
+```
+
+若要分发可执行文件，需执行：
+
+```powershell
+windeployqt build-msvc\PVZOLBrowser.exe
 ```
 
 ### Linux / macOS
 
 ```bash
-cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x.x/gcc_64
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x.x
 cmake --build build
 ```
 
-## 后续建议
+## 兼容性说明
 
-下一步优先建议补这些能力：
+- 现有工程基于 Qt 6.8.x
+- 因为 `Qt WebEngine` 本身限制，`Windows 7 / XP` 不属于当前可保证范围
+- 如果目标机器本身具备 `IE + Flash` 运行条件，Windows 路径会优先尝试走原生方案
+- 当切换到固定代理模式时，Windows 下新建标签会优先使用 Chromium 路径，以便代理设置对页面请求生效
 
-- 历史记录与收藏夹
-- 下载管理
-- 自定义用户代理与代理设置
-- 脚本注入
-- 更完整的错误页和证书处理
-- 真正的多语言翻译文件体系
+## 目录
+
+```text
+PVZOLBrowser/
+  assets/
+    ruffle/
+  src/
+    main.cpp
+    MainWindow.*
+    BrowserTab.*
+    BrowserView.*
+    browser/
+      BrowserConfig.h
+      IBrowserBackend.h
+      BrowserBackendFactory.*
+      FlashRuntime.*
+      RuffleProxyServer.*
+      WebEngineBackend.*
+      WindowsIeBackend.*
+  CMakeLists.txt
+  README.md
+```

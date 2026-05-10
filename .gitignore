@@ -1,0 +1,17 @@
+build/
+build-*/
+.qt/
+.tmp/
+aqtinstall.log
+*.user
+*.vcxproj*
+*.sln
+*.ninja
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+*.cache

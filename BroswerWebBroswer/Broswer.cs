@@ -4,14 +4,32 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Xml.Linq;
+using BroswerWebBroswer.Properties;
 
 namespace WebBrowserApp
 {
     public partial class Browser : Form
     {
         private const string DefaultHome = "http://pvzol.org/pvz/index.php/default/main";
+        private static readonly string[] MappingHosts =
+        {
+            "pvzol.org",
+            "youkia.pvz",
+            "pvz.youkia",
+            "youkia.com"
+        };
+        private static readonly string[] MappingUrlKeywords =
+        {
+            "/pvz/",
+            "/youkia/",
+            "youkia.pvz",
+            "pvz.youkia",
+            ".youkia.com"
+        };
 
         private readonly CookieManager _cookieManager;
         private readonly ProxyManager _proxyManager;
@@ -24,6 +42,16 @@ namespace WebBrowserApp
         private ProxySettingsUserControl _proxySettingsPanel;
         private IntPtr _nativeProxy = IntPtr.Zero;
         private int _currentPort = 9000;
+        private BrowserBackendMode _browserMode = BrowserBackendMode.NativeIe;
+        private BrowserBackendDecision _backendDecision;
+        private FlashRuntimeInfo _flashRuntimeInfo;
+        private IRuffleBrowserHost _ruffleHost;
+        private RuffleLocalProxy _ruffleProxy;
+        private string _pendingNavigationUrl;
+        private bool _ruffleInitializing;
+        private readonly bool _legacyDirectMode;
+        private bool _shutdownCleanupStarted;
+        private bool _allowImmediateClose;
 
         public Browser()
         {
@@ -32,12 +60,17 @@ namespace WebBrowserApp
             _cookieManager = new CookieManager();
             _proxyManager = new ProxyManager();
             _originalProxySnapshot = _proxyManager.CaptureCurrentProxy();
+            _legacyDirectMode = BrowserBackendSelector.IsLegacyWindowsOnly();
 
             InitializeCookieLibrary();
+            if (!_legacyDirectMode)
+            {
+                InitializeProxySystem();
+            }
             InitializeBrowserSettings();
-            InitializeProxySystem();
 
             Shown += Browser_Shown;
+            FormClosing += Browser_FormClosing;
         }
 
         private void Browser_Shown(object sender, EventArgs e)
@@ -53,54 +86,114 @@ namespace WebBrowserApp
             SetBrowserFeatureControl();
             webBrowser.ScriptErrorsSuppressed = true;
             webBrowser.AllowWebBrowserDrop = false;
+            _flashRuntimeInfo = FlashRuntimeDetector.Detect();
+            _backendDecision = BrowserBackendSelector.Decide(_flashRuntimeInfo);
+            RuntimeDiagnostics.Write(
+                "backend",
+                $"policy={_backendDecision?.Policy} flashAvailable={_flashRuntimeInfo?.IsAvailable} flashVersion={_flashRuntimeInfo?.Version} webView2Available={_backendDecision?.WebView2Available} selected={_backendDecision?.Mode} reason={_backendDecision?.Reason}");
+            InitializeBrowserBackend();
             _cookieManager.UpdateCurrentDomain(DefaultHome);
             txtUrl.Text = DefaultHome;
-            webBrowser.Url = new Uri(DefaultHome);
+            NavigateToAddress(DefaultHome);
             UpdateStatus(BuildStartupStatus());
         }
 
         private string BuildStartupStatus()
         {
-            string flashVersion = TryGetFlashVersion();
+            string flashVersion = _flashRuntimeInfo?.Version ?? "未知";
             string processArch = Environment.Is64BitProcess ? "x64" : "x86";
-            return $"浏览器已就绪 | 进程 {processArch} | Flash {flashVersion}";
+            string backend = _browserMode == BrowserBackendMode.RuffleWebView2 ? "Ruffle/WebView2" : "IE/Flash";
+            string reason = _backendDecision?.Reason ?? "未提供";
+            string proxyMode = _legacyDirectMode ? "直连兼容模式" : "本地映射代理";
+            return $"浏览器已就绪 | 进程 {processArch} | 后端 {backend} | Flash {flashVersion} | 网络 {proxyMode} | {reason}";
         }
 
-        private string TryGetFlashVersion()
+        private void InitializeBrowserBackend()
         {
+            _browserMode = _backendDecision?.Mode ?? BrowserBackendMode.NativeIe;
+            if (_browserMode != BrowserBackendMode.RuffleWebView2)
+            {
+                webBrowser.Visible = true;
+                return;
+            }
+
+            if (_ruffleProxy == null)
+            {
+                _ruffleProxy = new RuffleLocalProxy(
+                    Path.Combine(Application.StartupPath, "assets", "ruffle"),
+                    ResolveUpstreamProxy());
+                _ruffleProxy.ConfigureLocalMapping(
+                    Path.Combine(Application.StartupPath, "cache"),
+                    MappingHosts,
+                    MappingUrlKeywords);
+                RuntimeDiagnostics.Write("ruffle", "webview request handler ready");
+            }
+
+            if (_ruffleHost == null)
+            {
+                _ruffleHost = CreateRuffleHost();
+                _ruffleHost.SourceChanged += RuffleHost_SourceChanged;
+                _ruffleHost.NavigationCompleted += RuffleHost_NavigationCompleted;
+            }
+
+            webBrowser.Visible = false;
+            _ruffleHost.ViewControl.BringToFront();
+            _ = EnsureRuffleViewInitializedAsync();
+        }
+
+        private async Task EnsureRuffleViewInitializedAsync()
+        {
+            if (_ruffleHost == null || _ruffleHost.IsInitialized || _ruffleInitializing)
+            {
+                return;
+            }
+
+            _ruffleInitializing = true;
             try
             {
-                Type flashType = Type.GetTypeFromProgID("ShockwaveFlash.ShockwaveFlash", false);
-                if (flashType == null)
-                {
-                    return "未注册";
-                }
+                await _ruffleHost.InitializeAsync().ConfigureAwait(true);
+                _ruffleHost.ViewControl.Visible = true;
+                RuntimeDiagnostics.Write("ruffle", "webview2 host initialized");
 
-                object instance = Activator.CreateInstance(flashType);
-                if (instance == null)
+                if (!string.IsNullOrWhiteSpace(_pendingNavigationUrl))
                 {
-                    return "无法创建";
-                }
-
-                try
-                {
-                    object result = flashType.InvokeMember(
-                        "GetVariable",
-                        System.Reflection.BindingFlags.InvokeMethod,
-                        null,
-                        instance,
-                        new object[] { "$version" });
-                    return Convert.ToString(result) ?? "未知版本";
-                }
-                finally
-                {
-                    Marshal.FinalReleaseComObject(instance);
+                    string pendingUrl = _pendingNavigationUrl;
+                    _pendingNavigationUrl = null;
+                    NavigateToAddress(pendingUrl);
                 }
             }
             catch (Exception ex)
             {
-                return $"不可用: {ex.GetType().Name}";
+                _browserMode = BrowserBackendMode.NativeIe;
+                webBrowser.Visible = true;
+                if (_ruffleHost?.ViewControl != null)
+                {
+                    _ruffleHost.ViewControl.Visible = false;
+                }
+                RuntimeDiagnostics.Write("ruffle", $"initialization failed fallback=IE error={ex}");
+                UpdateStatus($"Ruffle 初始化失败，已回退到 IE：{ex.Message}");
             }
+            finally
+            {
+                _ruffleInitializing = false;
+            }
+        }
+
+        private IRuffleBrowserHost CreateRuffleHost()
+        {
+            Type hostType = typeof(Browser).Assembly.GetType("WebBrowserApp.RuffleWebViewHost", throwOnError: false);
+            if (hostType == null)
+            {
+                throw new InvalidOperationException("未找到 Ruffle WebView2 宿主类型。");
+            }
+
+            object instance = Activator.CreateInstance(hostType, pnlBrowserHost, _ruffleProxy);
+            if (!(instance is IRuffleBrowserHost host))
+            {
+                throw new InvalidOperationException("Ruffle WebView2 宿主初始化失败。");
+            }
+
+            return host;
         }
 
         private void SetBrowserFeatureControl()
@@ -198,8 +291,20 @@ namespace WebBrowserApp
             }
 
             Uri uri = new Uri(domain);
-            _cookieManager.SetCookies(uri);
-            webBrowser.Navigate(redirectUrl);
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                ClearRuffleCookies();
+                ApplyRuffleCookies(uri, cookieString);
+                _ruffleProxy?.SetCookieHeader(uri, cookieString);
+                RuntimeDiagnostics.Write("cookie", $"apply via ruffle proxy domain={domain} redirect={redirectUrl}");
+            }
+            else
+            {
+                _cookieManager.SetCookies(uri);
+                RuntimeDiagnostics.Write("cookie", $"apply via IE cookie store domain={domain} redirect={redirectUrl}");
+            }
+
+            NavigateToAddress(redirectUrl);
             txtUrl.Text = redirectUrl;
             UpdateStatus($"已应用 Cookie 并跳转到 {redirectUrl}");
         }
@@ -225,7 +330,7 @@ namespace WebBrowserApp
                     url = "http://" + url;
                 }
 
-                webBrowser.Navigate(url);
+                NavigateToAddress(url);
             }
             catch (Exception ex)
             {
@@ -233,11 +338,100 @@ namespace WebBrowserApp
             }
         }
 
+        private void NavigateToAddress(string url)
+        {
+            Uri target = NormalizeUrl(url);
+            txtUrl.Text = target.AbsoluteUri;
+
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleProxy == null)
+                {
+                    throw new InvalidOperationException("Ruffle 本地代理尚未启动。");
+                }
+
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    _pendingNavigationUrl = target.AbsoluteUri;
+                    _ = EnsureRuffleViewInitializedAsync();
+                    return;
+                }
+
+                _ruffleHost.Navigate(target.AbsoluteUri);
+                return;
+            }
+
+            webBrowser.Navigate(target);
+        }
+
+        private static Uri NormalizeUrl(string rawUrl)
+        {
+            if (string.IsNullOrWhiteSpace(rawUrl))
+            {
+                return new Uri(DefaultHome);
+            }
+
+            string normalized = rawUrl.Trim();
+            if (!normalized.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                && !normalized.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = "http://" + normalized;
+            }
+
+            return new Uri(normalized);
+        }
+
         private void WebBrowser_Navigated(object sender, WebBrowserNavigatedEventArgs e)
         {
+            if (_browserMode != BrowserBackendMode.NativeIe)
+            {
+                return;
+            }
+
             txtUrl.Text = e.Url.ToString();
             _cookieManager.UpdateCurrentDomain(e.Url.ToString());
             UpdateStatus($"正在浏览 {e.Url.Host}");
+        }
+
+        private void RuffleHost_SourceChanged(object sender, RuffleSourceChangedEventArgs e)
+        {
+            if (e?.Source == null)
+            {
+                return;
+            }
+
+            Uri displayUri = _ruffleProxy?.GetDisplayUri(e.Source) ?? e.Source;
+            txtUrl.Text = displayUri.AbsoluteUri;
+            _cookieManager.UpdateCurrentDomain(displayUri.AbsoluteUri);
+        }
+
+        private void RuffleHost_NavigationCompleted(object sender, RuffleNavigationCompletedEventArgs e)
+        {
+            if (e?.Source == null)
+            {
+                return;
+            }
+
+            Uri displayUri = _ruffleProxy?.GetDisplayUri(e.Source) ?? e.Source;
+            RuntimeDiagnostics.Write(
+                "ruffle-nav",
+                $"success={e.IsSuccess} status={e.WebErrorStatus} source={e.Source} display={displayUri}");
+            UpdateStatus(e.IsSuccess ? $"正在浏览 {displayUri.Host}" : $"Ruffle 页面加载失败: {e.WebErrorStatus}");
+        }
+
+        private void ClearRuffleCookies()
+        {
+            _ruffleHost?.ClearCookies();
+        }
+
+        private void ApplyRuffleCookies(Uri targetUri, string cookieHeader)
+        {
+            if (targetUri == null || string.IsNullOrWhiteSpace(targetUri.Host) || string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                return;
+            }
+
+            _ruffleHost?.ApplyCookies(targetUri, cookieHeader);
         }
 
         private void BtnGo_Click(object sender, EventArgs e)
@@ -253,6 +447,19 @@ namespace WebBrowserApp
 
         private void BtnRefresh_Click(object sender, EventArgs e)
         {
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    NavigateToAddress(txtUrl.Text);
+                    return;
+                }
+
+                _ruffleHost.Reload();
+                UpdateStatus("已刷新当前页面");
+                return;
+            }
+
             if (webBrowser.Url == null)
             {
                 txtUrl.Text = DefaultHome;
@@ -299,6 +506,14 @@ namespace WebBrowserApp
             }
 
             _settings = _proxySettingsPanel.CurrentSettings;
+            if (_legacyDirectMode)
+            {
+                UpdateStatus("当前系统为兼容模式，已保存上游代理设置，但未启用本地映射代理");
+                RuntimeDiagnostics.Write("proxy", "legacy direct mode active; proxy settings saved without starting native proxy");
+                return;
+            }
+
+            _ruffleProxy?.SetUpstreamProxy(ResolveUpstreamProxy());
             RestartProxyService();
         }
 
@@ -343,8 +558,126 @@ namespace WebBrowserApp
         {
             if (_cookieSelectionForm != null)
             {
+                SaveCookiePopupPlacement(_cookieSelectionForm);
                 _cookieSelectionForm.FormClosed -= CookieSelectionForm_FormClosed;
                 _cookieSelectionForm = null;
+            }
+        }
+
+        private void Browser_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            SaveCookiePopupPlacement(_cookieSelectionForm);
+            if (watcher != null)
+            {
+                watcher.EnableRaisingEvents = false;
+            }
+
+            if (_allowImmediateClose)
+            {
+                return;
+            }
+
+            if (_shutdownCleanupStarted)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            _shutdownCleanupStarted = true;
+            e.Cancel = true;
+
+            try
+            {
+                Enabled = false;
+                ShowInTaskbar = false;
+                Opacity = 0;
+                Hide();
+            }
+            catch
+            {
+            }
+
+            CloseProxyPopup();
+            CloseCookiePopup();
+            BeginShutdownCleanup();
+        }
+
+        private async void BeginShutdownCleanup()
+        {
+            try
+            {
+                await Task.Run(() => CleanupNonUiResources()).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"background cleanup failed error={ex}");
+            }
+
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            _allowImmediateClose = true;
+            try
+            {
+                Close();
+            }
+            catch
+            {
+            }
+        }
+
+        private void CleanupNonUiResources()
+        {
+            try
+            {
+                StopNativeProxy();
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"stop native proxy failed error={ex}");
+            }
+
+            try
+            {
+                _proxyManager.RestoreProxy(_originalProxySnapshot);
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"restore system proxy failed error={ex}");
+            }
+
+            try
+            {
+                watcher?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"dispose watcher failed error={ex}");
+            }
+
+            try
+            {
+                _ruffleProxy?.Dispose();
+                _ruffleProxy = null;
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"dispose ruffle proxy failed error={ex}");
+            }
+
+            try
+            {
+                if (_nativeProxy != IntPtr.Zero)
+                {
+                    FlashProxyNative.flash_proxy_destroy(_nativeProxy);
+                    _nativeProxy = IntPtr.Zero;
+                }
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"destroy native proxy failed error={ex}");
             }
         }
 
@@ -359,20 +692,86 @@ namespace WebBrowserApp
 
             if (popup is CookieSelectionForm)
             {
-                Point browserOrigin = webBrowser.PointToScreen(Point.Empty);
-                int desiredHeight = Math.Max(360, webBrowser.Height);
+                Control browserSurface = GetActiveBrowserSurface();
+                Point browserOrigin = browserSurface.PointToScreen(Point.Empty);
+                int desiredHeight = Math.Max(360, browserSurface.Height);
                 popup.Height = Math.Min(desiredHeight, workingArea.Height - 24);
-                y = Math.Max(workingArea.Top + 12, browserOrigin.Y);
+                if (!TryGetSavedCookiePopupLocation(popup.Size, out Point savedLocation))
+                {
+                    x = Right;
+                    y = Math.Max(workingArea.Top + 12, browserOrigin.Y);
+                }
+                else
+                {
+                    x = savedLocation.X;
+                    y = savedLocation.Y;
+                }
             }
 
-            if (y + popup.Height > workingArea.Bottom - 12)
-            {
-                y = Math.Max(workingArea.Top + 12, workingArea.Bottom - popup.Height - 12);
-            }
-
-            popup.Location = new Point(x, y);
+            popup.Location = ClampPopupLocation(new Point(x, y), popup.Size);
             popup.Show(this);
             popup.BringToFront();
+        }
+
+        private bool TryGetSavedCookiePopupLocation(Size popupSize, out Point location)
+        {
+            int savedLeft = Settings.Default.CookiePanelLeft;
+            int savedTop = Settings.Default.CookiePanelTop;
+            if (savedLeft < 0 || savedTop < 0)
+            {
+                location = Point.Empty;
+                return false;
+            }
+
+            location = ClampPopupLocation(new Point(savedLeft, savedTop), popupSize);
+            return true;
+        }
+
+        private Point ClampPopupLocation(Point location, Size popupSize)
+        {
+            Rectangle workingArea = Screen.FromPoint(location).WorkingArea;
+            int x = location.X;
+            int y = location.Y;
+
+            if (x < workingArea.Left)
+            {
+                x = workingArea.Left;
+            }
+
+            if (y < workingArea.Top + 12)
+            {
+                y = workingArea.Top + 12;
+            }
+
+            if (x + popupSize.Width > workingArea.Right - 12)
+            {
+                x = Math.Max(workingArea.Left, workingArea.Right - popupSize.Width - 12);
+            }
+
+            if (y + popupSize.Height > workingArea.Bottom - 12)
+            {
+                y = Math.Max(workingArea.Top + 12, workingArea.Bottom - popupSize.Height - 12);
+            }
+
+            return new Point(x, y);
+        }
+
+        private void SaveCookiePopupPlacement(Form popup)
+        {
+            if (popup == null || popup.IsDisposed)
+            {
+                return;
+            }
+
+            Point location = popup.Location;
+            if (location.X < 0 && location.Y < 0)
+            {
+                return;
+            }
+
+            Settings.Default.CookiePanelLeft = location.X;
+            Settings.Default.CookiePanelTop = location.Y;
+            Settings.Default.Save();
         }
 
         private void CloseProxyPopup()
@@ -393,6 +792,13 @@ namespace WebBrowserApp
 
         private void InitializeProxySystem()
         {
+            if (_legacyDirectMode)
+            {
+                RuntimeDiagnostics.Write("proxy", "legacy direct mode enabled; native proxy startup skipped");
+                UpdateStatus("当前系统为兼容模式，已跳过本地映射代理，浏览器将直接联网");
+                return;
+            }
+
             try
             {
                 RestartProxyService();
@@ -406,6 +812,12 @@ namespace WebBrowserApp
 
         private void RestartProxyService()
         {
+            if (_legacyDirectMode)
+            {
+                RuntimeDiagnostics.Write("proxy", "legacy direct mode enabled; restart request ignored");
+                return;
+            }
+
             EnsureNativeProxy();
 
             _currentPort = FindAvailablePort(9000, 9999);
@@ -423,6 +835,11 @@ namespace WebBrowserApp
 
         private void ApplyBrowserProxy(int port)
         {
+            if (_legacyDirectMode)
+            {
+                return;
+            }
+
             _proxyManager.SetProxyFromLocalPort(port);
         }
 
@@ -452,17 +869,16 @@ namespace WebBrowserApp
             }
 
             FlashProxyNative.flash_proxy_clear_mapping_hosts(_nativeProxy);
-            FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, "pvzol.org");
-            FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, "youkia.pvz");
-            FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, "pvz.youkia");
-            FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, "youkia.com");
+            foreach (string host in MappingHosts)
+            {
+                FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, host);
+            }
 
             FlashProxyNative.flash_proxy_clear_mapping_url_keywords(_nativeProxy);
-            FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, "/pvz/");
-            FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, "/youkia/");
-            FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, "youkia.pvz");
-            FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, "pvz.youkia");
-            FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, ".youkia.com");
+            foreach (string keyword in MappingUrlKeywords)
+            {
+                FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, keyword);
+            }
 
             string upstreamProxy = ResolveUpstreamProxy();
             if (FlashProxyNative.flash_proxy_set_upstream_proxy(_nativeProxy, upstreamProxy ?? string.Empty) == 0)
@@ -591,8 +1007,71 @@ namespace WebBrowserApp
             lblStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {message}";
         }
 
-        private void TryToggleEmbeddedFlashFullscreen()
+        private Control GetActiveBrowserSurface()
         {
+            if (_browserMode == BrowserBackendMode.RuffleWebView2 && _ruffleHost?.ViewControl != null && _ruffleHost.ViewControl.Visible)
+            {
+                return _ruffleHost.ViewControl;
+            }
+
+            return webBrowser;
+        }
+
+        private async void TryToggleEmbeddedFlashFullscreen()
+        {
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    UpdateStatus("Ruffle 页面尚未完成初始化");
+                    return;
+                }
+
+                try
+                {
+                    string script = @"
+(function(){
+    function request(node){
+        if(!node){return false;}
+        var methods=['requestFullscreen','webkitRequestFullscreen','mozRequestFullScreen','msRequestFullscreen'];
+        for(var i=0;i<methods.length;i++){
+            var fn=node[methods[i]];
+            if(typeof fn==='function'){
+                try{fn.call(node);return true;}catch(e){}
+            }
+        }
+        return false;
+    }
+    if(document.fullscreenElement||document.webkitFullscreenElement||document.msFullscreenElement){
+        if(document.exitFullscreen){document.exitFullscreen();return 'exit';}
+        if(document.webkitExitFullscreen){document.webkitExitFullscreen();return 'exit';}
+        if(document.msExitFullscreen){document.msExitFullscreen();return 'exit';}
+    }
+    var node=document.querySelector('ruffle-player,ruffle-embed,ruffle-object,object,embed');
+    return request(node)?'ok':'missing';
+})();";
+                    string result = await _ruffleHost.ExecuteScriptAsync(script).ConfigureAwait(true);
+                    if ((result ?? string.Empty).Contains("ok"))
+                    {
+                        UpdateStatus("已尝试让页面内 Flash 进入全屏");
+                    }
+                    else if ((result ?? string.Empty).Contains("exit"))
+                    {
+                        UpdateStatus("已尝试退出页面内全屏");
+                    }
+                    else
+                    {
+                        UpdateStatus("当前页面没有可全屏的 Ruffle/Flash 容器");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus($"Flash 全屏触发失败: {ex.Message}");
+                }
+
+                return;
+            }
+
             try
             {
                 if (webBrowser.Document == null)
@@ -666,16 +1145,18 @@ namespace WebBrowserApp
         {
             if (disposing)
             {
-                CloseProxyPopup();
-                CloseCookiePopup();
-                StopNativeProxy();
-                _proxyManager.RestoreProxy(_originalProxySnapshot);
-                watcher?.Dispose();
-
-                if (_nativeProxy != IntPtr.Zero)
+                if (!_shutdownCleanupStarted)
                 {
-                    FlashProxyNative.flash_proxy_destroy(_nativeProxy);
-                    _nativeProxy = IntPtr.Zero;
+                    CloseProxyPopup();
+                    CloseCookiePopup();
+                    CleanupNonUiResources();
+                }
+
+                watcher = null;
+                if (_ruffleHost != null)
+                {
+                    _ruffleHost.Dispose();
+                    _ruffleHost = null;
                 }
 
                 components?.Dispose();
@@ -876,14 +1357,37 @@ namespace WebBrowserApp
             StartPosition = FormStartPosition.Manual;
             Text = "Cookie 设置";
 
+            var rootLayout = new TableLayoutPanel
+            {
+                ColumnCount = 1,
+                Dock = DockStyle.Fill,
+                RowCount = 2,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92F));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            Controls.Add(rootLayout);
+
+            _cookiePanel = new FlowLayoutPanel
+            {
+                AutoScroll = true,
+                BackColor = Color.White,
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                Margin = Padding.Empty,
+                Padding = new Padding(14),
+                WrapContents = false
+            };
+            rootLayout.Controls.Add(_cookiePanel, 0, 1);
+
             var titlePanel = new Panel
             {
                 BackColor = Color.FromArgb(247, 250, 252),
-                Dock = DockStyle.Top,
-                Height = 92,
+                Dock = DockStyle.Fill,
                 Padding = new Padding(16, 12, 16, 12)
             };
-            Controls.Add(titlePanel);
+            rootLayout.Controls.Add(titlePanel, 0, 0);
 
             var titleLayout = new TableLayoutPanel
             {
@@ -921,17 +1425,6 @@ namespace WebBrowserApp
                 Margin = Padding.Empty
             };
             titleLayout.Controls.Add(hintLabel, 0, 1);
-
-            _cookiePanel = new FlowLayoutPanel
-            {
-                AutoScroll = true,
-                BackColor = Color.White,
-                Dock = DockStyle.Fill,
-                FlowDirection = FlowDirection.TopDown,
-                Padding = new Padding(14),
-                WrapContents = false
-            };
-            Controls.Add(_cookiePanel);
 
             _emptyLabel = new Label
             {

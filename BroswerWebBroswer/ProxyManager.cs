@@ -233,7 +233,7 @@ namespace WebBrowserApp
 
     public class ProxySettings
     {
-        public bool UseSystemProxy { get; set; } = true;
+        public bool UseSystemProxy { get; set; }
         public bool UseCustomProxy { get; set; }
         public string CustomProxyScheme { get; set; } = "http";
         public string CustomProxyHost { get; set; } = "127.0.0.1";

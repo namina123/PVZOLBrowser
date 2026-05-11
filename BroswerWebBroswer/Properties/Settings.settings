@@ -3,5 +3,12 @@
   <Profiles>
     <Profile Name="(Default)" />
   </Profiles>
-  <Settings />
+  <Settings>
+    <Setting Name="CookiePanelLeft" Type="System.Int32" Scope="User">
+      <Value Profile="(Default)">-1</Value>
+    </Setting>
+    <Setting Name="CookiePanelTop" Type="System.Int32" Scope="User">
+      <Value Profile="(Default)">-1</Value>
+    </Setting>
+  </Settings>
 </SettingsFile>

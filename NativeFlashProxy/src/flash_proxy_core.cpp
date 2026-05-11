@@ -302,6 +302,61 @@ std::string sanitizeRelativePath(std::string raw_path) {
     return cleaned;
 }
 
+#ifdef _WIN32
+bool connectTcpLegacyIpv4(const std::string& host, int port, SocketHandle& connected, std::string& error) {
+    hostent* host_entry = gethostbyname(host.c_str());
+    if (host_entry == nullptr || host_entry->h_addr_list == nullptr || host_entry->h_addr_list[0] == nullptr) {
+        unsigned long address = inet_addr(host.c_str());
+        if (address == INADDR_NONE) {
+            error = "legacy DNS lookup failed for " + host + " (WSA " + std::to_string(WSAGetLastError()) + ")";
+            return false;
+        }
+
+        sockaddr_in endpoint{};
+        endpoint.sin_family = AF_INET;
+        endpoint.sin_port = htons(static_cast<unsigned short>(port));
+        endpoint.sin_addr.s_addr = address;
+
+        SocketHandle candidate = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate == kInvalidSocket) {
+            error = "failed to create legacy IPv4 socket for " + host + " (" + lastSocketErrorMessage() + ")";
+            return false;
+        }
+
+        if (connect(candidate, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == 0) {
+            connected = candidate;
+            return true;
+        }
+
+        closeSocket(candidate);
+        error = "legacy IPv4 connect failed for " + host + ":" + std::to_string(port) + " (" + lastSocketErrorMessage() + ")";
+        return false;
+    }
+
+    for (char** current = host_entry->h_addr_list; *current != nullptr; ++current) {
+        sockaddr_in endpoint{};
+        endpoint.sin_family = AF_INET;
+        endpoint.sin_port = htons(static_cast<unsigned short>(port));
+        std::memcpy(&endpoint.sin_addr, *current, sizeof(endpoint.sin_addr));
+
+        SocketHandle candidate = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate == kInvalidSocket) {
+            continue;
+        }
+
+        if (connect(candidate, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == 0) {
+            connected = candidate;
+            return true;
+        }
+
+        closeSocket(candidate);
+    }
+
+    error = "legacy IPv4 connect failed for " + host + ":" + std::to_string(port) + " (" + lastSocketErrorMessage() + ")";
+    return false;
+}
+#endif
+
 SocketHandle connectTcp(const std::string& host, int port, std::string& error) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -312,6 +367,17 @@ SocketHandle connectTcp(const std::string& host, int port, std::string& error) {
     const auto port_text = std::to_string(port);
     const int gai_result = getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result);
     if (gai_result != 0) {
+#ifdef _WIN32
+        SocketHandle legacy_connected = kInvalidSocket;
+        if (connectTcpLegacyIpv4(host, port, legacy_connected, error)) {
+            return legacy_connected;
+        }
+        if (!error.empty()) {
+            error += "; ";
+        }
+        error += "getaddrinfo failed for " + host + " (WSA " + std::to_string(gai_result) + ")";
+        return kInvalidSocket;
+#endif
         error = "getaddrinfo failed for " + host;
         return kInvalidSocket;
     }

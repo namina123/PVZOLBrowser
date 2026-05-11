@@ -113,6 +113,55 @@ std::string lastSocketErrorMessage() {
 #endif
 }
 
+#ifdef _WIN32
+SocketHandle connectTcpLegacyIpv4(const std::string& host, int port) {
+    hostent* host_entry = gethostbyname(host.c_str());
+    if (host_entry == nullptr || host_entry->h_addr_list == nullptr || host_entry->h_addr_list[0] == nullptr) {
+        unsigned long address = inet_addr(host.c_str());
+        if (address == INADDR_NONE) {
+            return kInvalidSocket;
+        }
+
+        sockaddr_in endpoint{};
+        endpoint.sin_family = AF_INET;
+        endpoint.sin_port = htons(static_cast<unsigned short>(port));
+        endpoint.sin_addr.s_addr = address;
+
+        SocketHandle candidate = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate == kInvalidSocket) {
+            return kInvalidSocket;
+        }
+
+        if (connect(candidate, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == 0) {
+            return candidate;
+        }
+
+        closeSocket(candidate);
+        return kInvalidSocket;
+    }
+
+    for (char** current = host_entry->h_addr_list; *current != nullptr; ++current) {
+        sockaddr_in endpoint{};
+        endpoint.sin_family = AF_INET;
+        endpoint.sin_port = htons(static_cast<unsigned short>(port));
+        std::memcpy(&endpoint.sin_addr, *current, sizeof(endpoint.sin_addr));
+
+        SocketHandle candidate = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (candidate == kInvalidSocket) {
+            continue;
+        }
+
+        if (connect(candidate, reinterpret_cast<const sockaddr*>(&endpoint), sizeof(endpoint)) == 0) {
+            return candidate;
+        }
+
+        closeSocket(candidate);
+    }
+
+    return kInvalidSocket;
+}
+#endif
+
 SocketHandle connectTcp(const std::string& host, int port) {
 #ifdef _WIN32
     std::call_once(g_socket_init_once, []() {
@@ -129,7 +178,11 @@ SocketHandle connectTcp(const std::string& host, int port) {
     addrinfo* result = nullptr;
     const std::string port_text = std::to_string(port);
     if (getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result) != 0) {
+#ifdef _WIN32
+        return connectTcpLegacyIpv4(host, port);
+#else
         return kInvalidSocket;
+#endif
     }
 
     SocketHandle connected = kInvalidSocket;

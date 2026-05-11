@@ -16,6 +16,7 @@ namespace WebBrowserApp
         private Button btnProxyTool;
         private Button btnCookieTool;
         private Button btnFlashFullscreen;
+        private Panel pnlBrowserHost;
         private WebBrowser webBrowser;
         private Panel pnlStatusBar;
         private Label lblStatus;
@@ -31,11 +32,13 @@ namespace WebBrowserApp
             this.btnFlashFullscreen = new System.Windows.Forms.Button();
             this.btnCookieTool = new System.Windows.Forms.Button();
             this.btnProxyTool = new System.Windows.Forms.Button();
+            this.pnlBrowserHost = new System.Windows.Forms.Panel();
             this.webBrowser = new System.Windows.Forms.WebBrowser();
             this.pnlStatusBar = new System.Windows.Forms.Panel();
             this.lblStatus = new System.Windows.Forms.Label();
             this.pnlTopBar.SuspendLayout();
             this.pnlRightTools.SuspendLayout();
+            this.pnlBrowserHost.SuspendLayout();
             this.pnlStatusBar.SuspendLayout();
             this.SuspendLayout();
             // 
@@ -183,14 +186,23 @@ namespace WebBrowserApp
             this.btnProxyTool.UseVisualStyleBackColor = false;
             this.btnProxyTool.Click += new System.EventHandler(this.BtnProxyTool_Click);
             // 
+            // pnlBrowserHost
+            // 
+            this.pnlBrowserHost.Controls.Add(this.webBrowser);
+            this.pnlBrowserHost.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.pnlBrowserHost.Location = new System.Drawing.Point(0, 56);
+            this.pnlBrowserHost.Name = "pnlBrowserHost";
+            this.pnlBrowserHost.Size = new System.Drawing.Size(1068, 575);
+            this.pnlBrowserHost.TabIndex = 2;
+            // 
             // webBrowser
             // 
             this.webBrowser.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.webBrowser.Location = new System.Drawing.Point(0, 56);
+            this.webBrowser.Location = new System.Drawing.Point(0, 0);
             this.webBrowser.MinimumSize = new System.Drawing.Size(20, 18);
             this.webBrowser.Name = "webBrowser";
             this.webBrowser.Size = new System.Drawing.Size(1068, 575);
-            this.webBrowser.TabIndex = 2;
+            this.webBrowser.TabIndex = 0;
             this.webBrowser.Navigated += new System.Windows.Forms.WebBrowserNavigatedEventHandler(this.WebBrowser_Navigated);
             // 
             // pnlStatusBar
@@ -222,7 +234,7 @@ namespace WebBrowserApp
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.BackColor = System.Drawing.Color.White;
             this.ClientSize = new System.Drawing.Size(1160, 664);
-            this.Controls.Add(this.webBrowser);
+            this.Controls.Add(this.pnlBrowserHost);
             this.Controls.Add(this.pnlRightTools);
             this.Controls.Add(this.pnlTopBar);
             this.Controls.Add(this.pnlStatusBar);
@@ -233,6 +245,7 @@ namespace WebBrowserApp
             this.pnlTopBar.ResumeLayout(false);
             this.pnlTopBar.PerformLayout();
             this.pnlRightTools.ResumeLayout(false);
+            this.pnlBrowserHost.ResumeLayout(false);
             this.pnlStatusBar.ResumeLayout(false);
             this.ResumeLayout(false);
 

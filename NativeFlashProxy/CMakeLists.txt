@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 
 project(flash_proxy_core LANGUAGES CXX)
 
+if(MSVC)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+
 add_library(flash_proxy_core SHARED
     src/amf_bridge.cpp
     src/flash_proxy_core.cpp
@@ -37,6 +41,8 @@ target_compile_features(flash_proxy_core PUBLIC cxx_std_17)
 target_compile_definitions(flash_proxy_core PRIVATE FLASH_PROXY_CORE_EXPORTS)
 
 if(MSVC)
+    set_property(TARGET flash_proxy_core PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(flash_proxy_core PRIVATE /W4 /EHsc /utf-8)
 else()
     target_compile_options(flash_proxy_core PRIVATE -Wall -Wextra -Wpedantic)

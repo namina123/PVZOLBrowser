@@ -26,5 +26,35 @@ namespace BroswerWebBroswer.Properties
                 return defaultInstance;
             }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("-1")]
+        public int CookiePanelLeft
+        {
+            get
+            {
+                return ((int)(this["CookiePanelLeft"]));
+            }
+            set
+            {
+                this["CookiePanelLeft"] = value;
+            }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("-1")]
+        public int CookiePanelTop
+        {
+            get
+            {
+                return ((int)(this["CookiePanelTop"]));
+            }
+            set
+            {
+                this["CookiePanelTop"] = value;
+            }
+        }
     }
 }

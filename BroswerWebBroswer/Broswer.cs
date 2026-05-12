@@ -1428,7 +1428,7 @@ namespace WebBrowserApp
                 return;
             }
 
-            ClearBrowserCookies();
+            ClearBrowserCookies(rootUri, targetUri);
 
             if (_browserMode == BrowserBackendMode.RuffleWebView2)
             {
@@ -2515,7 +2515,7 @@ namespace WebBrowserApp
             return Regex.Unescape(normalized);
         }
 
-        private void ClearBrowserCookies()
+        private void ClearBrowserCookies(params Uri[] candidateUris)
         {
             try
             {
@@ -2527,7 +2527,7 @@ namespace WebBrowserApp
 
             try
             {
-                _cookieManager.ClearAllCookies();
+                _cookieManager.ClearAllCookies(candidateUris);
             }
             catch
             {
@@ -3006,6 +3006,14 @@ namespace WebBrowserApp
             [DllImport("wininet.dll", CharSet = CharSet.Auto, SetLastError = true)]
             private static extern bool InternetSetCookie(string lpszUrlName, string lpszCookieName, string lpszCookieData);
 
+            [DllImport("wininet.dll", CharSet = CharSet.Auto, SetLastError = true)]
+            private static extern int InternetSetCookieEx(
+                string lpszUrl,
+                string lpszCookieName,
+                string lpszCookieData,
+                int dwFlags,
+                IntPtr dwReserved);
+
             [DllImport("wininet.dll", SetLastError = true)]
             private static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int lpdwBufferLength);
 
@@ -3059,11 +3067,11 @@ namespace WebBrowserApp
                 ApplyCookieEntriesToUri(targetUri, entries);
             }
 
-            public void ClearAllCookies()
+            public void ClearAllCookies(IEnumerable<Uri> candidateUris)
             {
                 InternetSetOption(IntPtr.Zero, InternetOptionEndBrowserSession, IntPtr.Zero, 0);
 
-                var cleanupUrls = CollectRelevantCleanupUrls();
+                var cleanupUrls = CollectRelevantCleanupUrls(candidateUris);
                 var cookieNames = new HashSet<string>(_appliedCookieNames, StringComparer.OrdinalIgnoreCase);
                 foreach (string url in cleanupUrls)
                 {
@@ -3120,7 +3128,7 @@ namespace WebBrowserApp
                 }
             }
 
-            private HashSet<string> CollectRelevantCleanupUrls()
+            private HashSet<string> CollectRelevantCleanupUrls(IEnumerable<Uri> candidateUris)
             {
                 var cleanupUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (string knownUrl in KnownRelevantUrls)
@@ -3147,6 +3155,14 @@ namespace WebBrowserApp
                 if (_currentDomain != null)
                 {
                     foreach (string candidate in BuildRelevantUrlVariants(_currentDomain))
+                    {
+                        cleanupUrls.Add(candidate);
+                    }
+                }
+
+                foreach (Uri candidateUri in candidateUris ?? Enumerable.Empty<Uri>())
+                {
+                    foreach (string candidate in BuildRelevantUrlVariants(candidateUri))
                     {
                         cleanupUrls.Add(candidate);
                     }
@@ -3179,6 +3195,24 @@ namespace WebBrowserApp
                     if (IsRelevantCookieUrl(candidate))
                     {
                         yield return candidate;
+                    }
+                }
+
+                if (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+                {
+                    string httpsAuthority = "https://" + uri.Authority;
+                    foreach (string suffix in new[]
+                    {
+                        "/",
+                        "/index.php",
+                        "/pvz/index.php/default/main"
+                    })
+                    {
+                        string candidate = httpsAuthority + suffix;
+                        if (IsRelevantCookieUrl(candidate))
+                        {
+                            yield return candidate;
+                        }
                     }
                 }
             }
@@ -3253,6 +3287,7 @@ namespace WebBrowserApp
                             string cookieData = string.IsNullOrWhiteSpace(domain)
                                 ? $"{cookieName}=deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path={path}"
                                 : $"{cookieName}=deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path={path};domain={domain}";
+                            InternetSetCookieEx(url, null, cookieData, Browser.InternetCookieHttpOnly, IntPtr.Zero);
                             InternetSetCookie(url, null, cookieData);
                         }
                         catch

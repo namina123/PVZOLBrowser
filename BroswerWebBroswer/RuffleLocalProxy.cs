@@ -45,15 +45,13 @@ namespace WebBrowserApp
         private readonly string _assetRootPath;
         private readonly object _stateLock = new object();
         private readonly Dictionary<string, string> _domainCookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        private readonly List<string> _mappingHosts = new List<string>();
-        private readonly List<string> _mappingUrlKeywords = new List<string>();
         private static readonly HashSet<string> EmptyArgumentAmfTargets = new HashSet<string>(StringComparer.Ordinal)
         {
             "api.duty.getAll",
             "api.active.getState",
             "api.apiorganism.getEvolutionOrgs"
         };
-        private string _cacheRootPath;
+        private LocalMappingRuleSet _localMappingRules;
         private readonly string _amfDumpRootPath;
         private HttpListener _listener;
         private CancellationTokenSource _cancellation;
@@ -139,7 +137,7 @@ namespace WebBrowserApp
         {
             _assetRootPath = assetRootPath;
             _upstreamProxy = upstreamProxy ?? string.Empty;
-            _cacheRootPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cache");
+            _localMappingRules = LocalMappingRuleSet.CreateDefault(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cache"));
             _amfDumpRootPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "amf_dumps");
         }
 
@@ -183,28 +181,16 @@ namespace WebBrowserApp
             return FindCookieHeader(targetUri);
         }
 
-        internal void ConfigureLocalMapping(string cacheRootPath, IEnumerable<string> mappingHosts, IEnumerable<string> mappingUrlKeywords)
+        internal void ConfigureLocalMapping(LocalMappingRuleSet localMappingRules)
         {
             lock (_stateLock)
             {
-                _cacheRootPath = string.IsNullOrWhiteSpace(cacheRootPath)
-                    ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cache")
-                    : cacheRootPath;
-
-                _mappingHosts.Clear();
-                _mappingHosts.AddRange((mappingHosts ?? Enumerable.Empty<string>())
-                    .Where(value => !string.IsNullOrWhiteSpace(value))
-                    .Select(value => value.Trim().ToLowerInvariant()));
-
-                _mappingUrlKeywords.Clear();
-                _mappingUrlKeywords.AddRange((mappingUrlKeywords ?? Enumerable.Empty<string>())
-                    .Where(value => !string.IsNullOrWhiteSpace(value))
-                    .Select(value => value.Trim().ToLowerInvariant()));
+                _localMappingRules = localMappingRules ?? LocalMappingRuleSet.CreateDefault(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cache"));
             }
 
             RuntimeDiagnostics.Write(
                 "ruffle-localmap",
-                $"configured cacheRoot={_cacheRootPath} hosts={_mappingHosts.Count} keywords={_mappingUrlKeywords.Count}");
+                $"configured {_localMappingRules.Describe()}");
         }
 
         internal void Start()
@@ -591,44 +577,8 @@ namespace WebBrowserApp
         private bool TryBuildLocalFileResponse(Uri originalUri, out RuffleResolvedResponse response)
         {
             response = null;
-            string cacheRootPath;
-            List<string> mappingHosts;
-            List<string> mappingUrlKeywords;
-            lock (_stateLock)
+            if (!TryResolveLocalMappingFile(originalUri, out string localPath))
             {
-                cacheRootPath = _cacheRootPath;
-                mappingHosts = new List<string>(_mappingHosts);
-                mappingUrlKeywords = new List<string>(_mappingUrlKeywords);
-            }
-
-            if (string.IsNullOrWhiteSpace(cacheRootPath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip empty cache root target={originalUri}");
-                return false;
-            }
-
-            string hostLower = (originalUri.Host ?? string.Empty).ToLowerInvariant();
-            string absoluteUrlLower = originalUri.AbsoluteUri.ToLowerInvariant();
-            bool matches = mappingHosts.Any(value => !string.IsNullOrWhiteSpace(value) && hostLower.Contains(value))
-                || mappingUrlKeywords.Any(value => !string.IsNullOrWhiteSpace(value) && absoluteUrlLower.Contains(value));
-            if (!matches)
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip no rule target={originalUri}");
-                return false;
-            }
-
-            string relativePath = SanitizeRelativePath(originalUri.PathAndQuery);
-            if (string.IsNullOrWhiteSpace(relativePath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip invalid relative path target={originalUri}");
-                return false;
-            }
-
-            string localPath = Path.Combine(cacheRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
-            RuntimeDiagnostics.Write("ruffle-localmap", $"lookup target={originalUri} relative={relativePath} file={localPath}");
-            if (!File.Exists(localPath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"miss target={originalUri} file={localPath}");
                 return false;
             }
 
@@ -890,44 +840,8 @@ namespace WebBrowserApp
 
         private bool TryServeLocalFile(HttpListenerContext context, Uri originalUri)
         {
-            string cacheRootPath;
-            List<string> mappingHosts;
-            List<string> mappingUrlKeywords;
-            lock (_stateLock)
+            if (!TryResolveLocalMappingFile(originalUri, out string localPath))
             {
-                cacheRootPath = _cacheRootPath;
-                mappingHosts = new List<string>(_mappingHosts);
-                mappingUrlKeywords = new List<string>(_mappingUrlKeywords);
-            }
-
-            if (string.IsNullOrWhiteSpace(cacheRootPath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip empty cache root target={originalUri}");
-                return false;
-            }
-
-            string hostLower = (originalUri.Host ?? string.Empty).ToLowerInvariant();
-            string absoluteUrlLower = originalUri.AbsoluteUri.ToLowerInvariant();
-            bool matches = mappingHosts.Any(value => !string.IsNullOrWhiteSpace(value) && hostLower.Contains(value))
-                || mappingUrlKeywords.Any(value => !string.IsNullOrWhiteSpace(value) && absoluteUrlLower.Contains(value));
-            if (!matches)
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip no rule target={originalUri}");
-                return false;
-            }
-
-            string relativePath = SanitizeRelativePath(originalUri.PathAndQuery);
-            if (string.IsNullOrWhiteSpace(relativePath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"skip invalid relative path target={originalUri}");
-                return false;
-            }
-
-            string localPath = Path.Combine(cacheRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
-            RuntimeDiagnostics.Write("ruffle-localmap", $"lookup target={originalUri} relative={relativePath} file={localPath}");
-            if (!File.Exists(localPath))
-            {
-                RuntimeDiagnostics.Write("ruffle-localmap", $"miss target={originalUri} file={localPath}");
                 return false;
             }
 
@@ -943,6 +857,52 @@ namespace WebBrowserApp
                 GuessMimeType(localPath),
                 body,
                 context.Request.HttpMethod.Equals("HEAD", StringComparison.OrdinalIgnoreCase));
+            return true;
+        }
+
+        private bool TryResolveLocalMappingFile(Uri originalUri, out string localPath)
+        {
+            localPath = null;
+            LocalMappingRuleSet localMappingRules;
+            lock (_stateLock)
+            {
+                localMappingRules = _localMappingRules;
+            }
+
+            if (localMappingRules == null)
+            {
+                RuntimeDiagnostics.Write("ruffle-localmap", $"skip no rules target={originalUri}");
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(localMappingRules.CacheRootPath))
+            {
+                RuntimeDiagnostics.Write("ruffle-localmap", $"skip empty cache root target={originalUri}");
+                return false;
+            }
+
+            if (!localMappingRules.Matches(originalUri))
+            {
+                RuntimeDiagnostics.Write("ruffle-localmap", $"skip no rule target={originalUri}");
+                return false;
+            }
+
+            string relativePath = SanitizeRelativePath(originalUri.PathAndQuery);
+            if (string.IsNullOrWhiteSpace(relativePath))
+            {
+                RuntimeDiagnostics.Write("ruffle-localmap", $"skip invalid relative path target={originalUri}");
+                return false;
+            }
+
+            localPath = Path.Combine(localMappingRules.CacheRootPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            RuntimeDiagnostics.Write("ruffle-localmap", $"lookup target={originalUri} relative={relativePath} file={localPath}");
+            if (!File.Exists(localPath))
+            {
+                RuntimeDiagnostics.Write("ruffle-localmap", $"miss target={originalUri} file={localPath}");
+                localPath = null;
+                return false;
+            }
+
             return true;
         }
 

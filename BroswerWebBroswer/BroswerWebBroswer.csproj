@@ -129,6 +129,7 @@
     <Compile Include="FlashRuntimeDetector.cs" />
     <Compile Include="FlashRuntimeInfo.cs" />
     <Compile Include="IRuffleBrowserHost.cs" />
+    <Compile Include="LocalMappingRuleSet.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="ProxyManager.cs">

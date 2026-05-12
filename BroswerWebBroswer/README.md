@@ -28,10 +28,12 @@
 
 ## 本地映射
 
-当前 `IE/Flash` 与 `Ruffle/WebView2` 两条线路都使用同一组本地映射规则：
+当前 `IE/Flash` 与 `Ruffle/WebView2` 两条线路都使用同一份 `LocalMappingRuleSet`：
 
-- host 规则：`pvzol.org`、`youkia.pvz`、`pvz.youkia`、`youkia.com`
-- URL 关键字规则：`/pvz/`、`/youkia/`、`youkia.pvz`、`pvz.youkia`、`.youkia.com`
+- 精确 host：`pvzol.org`
+- host suffix：`*.pvzol.org`、`*.youkia.pvz.youkia.com`
+- 兼容性 host contains：`youkia.pvz`、`pvz.youkia`、`youkia.com`
+- URL 关键字规则：`/pvz/`、`/youkia/`、`youkia.pvz`、`pvz.youkia`、`.youkia.com`、`.youkia.pvz.youkia.com`
 
 命中后优先从可执行文件同目录的 `cache` 目录读取本地文件，不再转发上游请求。
 
@@ -40,7 +42,7 @@
 - native `flash_proxy_core`
 - `RuffleLocalProxy`
 
-后续若继续抽离，应优先把这部分配置入口继续收敛到 core，而不是在 UI 层分叉维护。
+后续若继续扩展新的域名或路径，应优先只改 `LocalMappingRuleSet.cs`，避免在 UI、Ruffle 代理、native core 配置三处重复加硬编码。
 
 ## 后端选择策略
 

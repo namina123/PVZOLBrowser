@@ -28,26 +28,12 @@ namespace WebBrowserApp
 
         private const int InternetCookieHttpOnly = 0x00002000;
         private const string DefaultHome = "http://pvz.youkia.com";
-        private static readonly string[] MappingHosts =
-        {
-            "pvzol.org",
-            "youkia.pvz",
-            "pvz.youkia",
-            "youkia.com"
-        };
-        private static readonly string[] MappingUrlKeywords =
-        {
-            "/pvz/",
-            "/youkia/",
-            "youkia.pvz",
-            "pvz.youkia",
-            ".youkia.com"
-        };
 
         private readonly CookieManager _cookieManager;
         private readonly CookieProfileManager _cookieProfileManager;
         private readonly ProxyManager _proxyManager;
         private readonly ZoneOrderManager _zoneOrderManager;
+        private readonly LocalMappingRuleSet _localMappingRules;
         private readonly List<string> _cookieFiles = new List<string>();
         private readonly List<CookieDisplayEntry> _cookieDisplayEntries = new List<CookieDisplayEntry>();
         private readonly Timer _zoneJumpSavePollTimer;
@@ -90,6 +76,8 @@ namespace WebBrowserApp
         private bool _pendingZoneJumpRetryAvailable;
         private bool _pendingZoneJumpRetryConsumed;
         private bool _zoneJumpSavePollInFlight;
+        private Point _lastWindowLocation;
+        private bool _hasLastWindowLocation;
 
         public Browser()
         {
@@ -99,6 +87,7 @@ namespace WebBrowserApp
             _cookieProfileManager = new CookieProfileManager(AppDomain.CurrentDomain.BaseDirectory);
             _proxyManager = new ProxyManager();
             _zoneOrderManager = new ZoneOrderManager(AppDomain.CurrentDomain.BaseDirectory);
+            _localMappingRules = LocalMappingRuleSet.CreateDefault(Path.Combine(Application.StartupPath, "cache"));
             _originalProxySnapshot = _proxyManager.CaptureCurrentProxy();
             _legacyDirectMode = BrowserBackendSelector.IsLegacyWindowsOnly();
             _cookieToolDefaultBackColor = btnCookieTool.BackColor;
@@ -129,10 +118,13 @@ namespace WebBrowserApp
             Shown += Browser_Shown;
             FormClosing += Browser_FormClosing;
             Resize += Browser_Resize;
+            Move += Browser_Move;
         }
 
         private void Browser_Shown(object sender, EventArgs e)
         {
+            _lastWindowLocation = Location;
+            _hasLastWindowLocation = true;
             LayoutTopBarControls();
             PositionCookieImportToast();
             if (_cookieSelectionForm == null || _cookieSelectionForm.IsDisposed)
@@ -145,7 +137,30 @@ namespace WebBrowserApp
         {
             PositionCookieImportToast();
             PositionZoneJumpSavePrompt();
+            UpdateCookiePopupPlacement(true);
             UpdateZoneJumpPopupPlacement();
+        }
+
+        private void Browser_Move(object sender, EventArgs e)
+        {
+            if (!_hasLastWindowLocation)
+            {
+                _lastWindowLocation = Location;
+                _hasLastWindowLocation = true;
+                return;
+            }
+
+            int deltaX = Left - _lastWindowLocation.X;
+            int deltaY = Top - _lastWindowLocation.Y;
+            _lastWindowLocation = Location;
+
+            if (deltaX == 0 && deltaY == 0)
+            {
+                return;
+            }
+
+            MoveFloatingPopupWithWindow(_cookieSelectionForm, deltaX, deltaY);
+            MoveFloatingPopupWithWindow(_serverJumpForm, deltaX, deltaY);
         }
 
         private void InitializeBrowserSettings()
@@ -159,6 +174,8 @@ namespace WebBrowserApp
                 "backend",
                 $"policy={_backendDecision?.Policy} flashAvailable={_flashRuntimeInfo?.IsAvailable} flashVersion={_flashRuntimeInfo?.Version} webView2Available={_backendDecision?.WebView2Available} selected={_backendDecision?.Mode} reason={_backendDecision?.Reason}");
             InitializeBrowserBackend();
+            ClearBrowserCookies();
+            RuntimeDiagnostics.Write("cookie", $"startup cookie clear mode={_browserMode}");
             _cookieManager.UpdateCurrentDomain(DefaultHome);
             txtUrl.Text = DefaultHome;
             NavigateToAddress(DefaultHome);
@@ -189,10 +206,7 @@ namespace WebBrowserApp
                 _ruffleProxy = new RuffleLocalProxy(
                     Path.Combine(Application.StartupPath, "assets", "ruffle"),
                     ResolveUpstreamProxy());
-                _ruffleProxy.ConfigureLocalMapping(
-                    Path.Combine(Application.StartupPath, "cache"),
-                    MappingHosts,
-                    MappingUrlKeywords);
+                _ruffleProxy.ConfigureLocalMapping(_localMappingRules);
                 RuntimeDiagnostics.Write("ruffle", "webview request handler ready");
             }
 
@@ -1297,7 +1311,7 @@ namespace WebBrowserApp
 
             _serverJumpPanel = new ServerJumpPanel(HandleZoneJumpRequest, HandleZoneFavoriteToggle, HandleZoneJumpPanelClosed)
             {
-                Width = 248
+                Width = 292
             };
             _serverJumpPanel.SetOrderFilePath(_zoneOrderManager.FilePath);
         }
@@ -1314,11 +1328,11 @@ namespace WebBrowserApp
             {
                 AutoScaleMode = AutoScaleMode.Font,
                 BackColor = Color.White,
-                ClientSize = new Size(248, 420),
+                ClientSize = new Size(292, 420),
                 FormBorderStyle = FormBorderStyle.SizableToolWindow,
                 MaximizeBox = false,
                 MinimizeBox = false,
-                MinimumSize = new Size(248, 340),
+                MinimumSize = new Size(292, 340),
                 ShowIcon = false,
                 ShowInTaskbar = false,
                 StartPosition = FormStartPosition.Manual,
@@ -1788,14 +1802,10 @@ namespace WebBrowserApp
 
             if (popup is CookieSelectionForm)
             {
-                Control browserSurface = GetActiveBrowserSurface();
-                Point browserOrigin = browserSurface.PointToScreen(Point.Empty);
-                int desiredHeight = Math.Max(360, browserSurface.Height);
-                popup.Height = Math.Min(desiredHeight, workingArea.Height - 24);
                 if (!TryGetSavedCookiePopupLocation(popup.Size, out Point savedLocation))
                 {
                     x = Right;
-                    y = Math.Max(workingArea.Top + 12, browserOrigin.Y);
+                    y = Math.Max(workingArea.Top + 12, GetActiveBrowserSurface().PointToScreen(Point.Empty).Y);
                 }
                 else
                 {
@@ -1806,6 +1816,7 @@ namespace WebBrowserApp
 
             popup.Location = ClampPopupLocation(new Point(x, y), popup.Size);
             popup.Show(this);
+            UpdateCookiePopupPlacement(true);
             popup.BringToFront();
         }
 
@@ -1813,14 +1824,45 @@ namespace WebBrowserApp
         {
             int savedLeft = Settings.Default.CookiePanelLeft;
             int savedTop = Settings.Default.CookiePanelTop;
-            if (savedLeft < 0 || savedTop < 0)
+            if (savedLeft == -1 && savedTop == -1)
             {
                 location = Point.Empty;
                 return false;
             }
 
-            location = ClampPopupLocation(new Point(savedLeft, savedTop), popupSize);
+            location = ClampPopupLocation(new Point(Left + savedLeft, Top + savedTop), popupSize);
             return true;
+        }
+
+        private void UpdateCookiePopupPlacement(bool keepCurrentRelativeOffset)
+        {
+            if (_cookieSelectionForm == null || _cookieSelectionForm.IsDisposed)
+            {
+                return;
+            }
+
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            Control browserSurface = GetActiveBrowserSurface();
+            Point browserOrigin = browserSurface.PointToScreen(Point.Empty);
+            int desiredHeight = Math.Max(360, browserSurface.Height);
+            _cookieSelectionForm.Height = Math.Min(desiredHeight, workingArea.Height - 24);
+
+            Point targetLocation;
+            if (keepCurrentRelativeOffset)
+            {
+                Point relativeOffset = new Point(_cookieSelectionForm.Left - Left, _cookieSelectionForm.Top - Top);
+                targetLocation = new Point(Left + relativeOffset.X, Top + relativeOffset.Y);
+            }
+            else if (TryGetSavedCookiePopupLocation(_cookieSelectionForm.Size, out Point savedLocation))
+            {
+                targetLocation = savedLocation;
+            }
+            else
+            {
+                targetLocation = new Point(Right, Math.Max(workingArea.Top + 12, browserOrigin.Y));
+            }
+
+            _cookieSelectionForm.Location = ClampPopupLocation(targetLocation, _cookieSelectionForm.Size);
         }
 
         private void UpdateZoneJumpPopupPlacement()
@@ -1888,9 +1930,21 @@ namespace WebBrowserApp
                 return;
             }
 
-            Settings.Default.CookiePanelLeft = location.X;
-            Settings.Default.CookiePanelTop = location.Y;
+            Settings.Default.CookiePanelLeft = location.X - Left;
+            Settings.Default.CookiePanelTop = location.Y - Top;
             Settings.Default.Save();
+        }
+
+        private void MoveFloatingPopupWithWindow(Form popup, int deltaX, int deltaY)
+        {
+            if (popup == null || popup.IsDisposed || !popup.Visible)
+            {
+                return;
+            }
+
+            popup.Location = ClampPopupLocation(
+                new Point(popup.Left + deltaX, popup.Top + deltaY),
+                popup.Size);
         }
 
         private void CloseProxyPopup()
@@ -1987,7 +2041,7 @@ namespace WebBrowserApp
 
         private void ConfigureNativeProxy()
         {
-            string cacheRoot = Path.Combine(Application.StartupPath, "cache");
+            string cacheRoot = _localMappingRules.CacheRootPath;
             Directory.CreateDirectory(cacheRoot);
 
             if (FlashProxyNative.flash_proxy_set_cache_root(_nativeProxy, cacheRoot) == 0)
@@ -1996,16 +2050,18 @@ namespace WebBrowserApp
             }
 
             FlashProxyNative.flash_proxy_clear_mapping_hosts(_nativeProxy);
-            foreach (string host in MappingHosts)
+            foreach (string host in _localMappingRules.NativeHostFragments)
             {
                 FlashProxyNative.flash_proxy_add_mapping_host(_nativeProxy, host);
             }
 
             FlashProxyNative.flash_proxy_clear_mapping_url_keywords(_nativeProxy);
-            foreach (string keyword in MappingUrlKeywords)
+            foreach (string keyword in _localMappingRules.UrlKeywords)
             {
                 FlashProxyNative.flash_proxy_add_mapping_url_keyword(_nativeProxy, keyword);
             }
+
+            RuntimeDiagnostics.Write("localmap", $"native proxy mapping configured {_localMappingRules.Describe()}");
 
             string upstreamProxy = ResolveUpstreamProxy();
             if (FlashProxyNative.flash_proxy_set_upstream_proxy(_nativeProxy, upstreamProxy ?? string.Empty) == 0)
@@ -2734,7 +2790,41 @@ namespace WebBrowserApp
 
                 string script = @"
 (function () {
-    function tryRequest(node) {
+    function getStyleText(node) {
+        if (!node) return '';
+        try { return node.getAttribute('style') || ''; } catch (e) { return ''; }
+    }
+
+    function setStyleText(node, value) {
+        if (!node) return;
+        try {
+            if (value) {
+                node.setAttribute('style', value);
+            } else {
+                node.removeAttribute('style');
+            }
+        } catch (e) {}
+    }
+
+    function isMarked(node) {
+        try { return node && node.getAttribute('data-pvzol-inline-fullscreen') === '1'; } catch (e) { return false; }
+    }
+
+    function storeStyle(node, key) {
+        if (!node) return;
+        try { node.setAttribute(key, getStyleText(node)); } catch (e) {}
+    }
+
+    function restoreStyle(node, key) {
+        if (!node) return;
+        try {
+            var value = node.getAttribute(key) || '';
+            setStyleText(node, value);
+            node.removeAttribute(key);
+        } catch (e) {}
+    }
+
+    function tryNativeFullscreen(node) {
         if (!node) return false;
         if (typeof node.focus === 'function') {
             try { node.focus(); } catch (e) {}
@@ -2749,15 +2839,53 @@ namespace WebBrowserApp
         return false;
     }
 
-    var nodes = document.querySelectorAll('object, embed');
-    for (var i = 0; i < nodes.length; i++) {
-        if (tryRequest(nodes[i])) return 'ok';
+    function enterInlineFullscreen(node) {
+        if (!node) return 'missing';
+        var parent = node.parentElement || node.parentNode;
+        storeStyle(node, 'data-pvzol-prev-style');
+        storeStyle(parent, 'data-pvzol-prev-style');
+        storeStyle(document.body, 'data-pvzol-prev-style');
+        storeStyle(document.documentElement, 'data-pvzol-prev-style');
+        try { node.setAttribute('data-pvzol-inline-fullscreen', '1'); } catch (e) {}
+        setStyleText(document.documentElement, 'width:100%;height:100%;overflow:hidden;background:#000;margin:0;padding:0;');
+        setStyleText(document.body, 'width:100%;height:100%;overflow:hidden;background:#000;margin:0;padding:0;');
+        if (parent) {
+            setStyleText(parent, 'position:fixed;left:0;top:0;width:100%;height:100%;margin:0;padding:0;z-index:2147483646;background:#000;overflow:hidden;');
+        }
+        setStyleText(node, 'position:fixed;left:0;top:0;width:100%;height:100%;margin:0;padding:0;z-index:2147483647;background:#000;');
+        if (typeof node.focus === 'function') {
+            try { node.focus(); } catch (e) {}
+        }
+        return 'inline-enter';
+    }
+
+    function exitInlineFullscreen(node) {
+        if (!node) return 'missing';
+        var parent = node.parentElement || node.parentNode;
+        restoreStyle(node, 'data-pvzol-prev-style');
+        restoreStyle(parent, 'data-pvzol-prev-style');
+        restoreStyle(document.body, 'data-pvzol-prev-style');
+        restoreStyle(document.documentElement, 'data-pvzol-prev-style');
+        try { node.removeAttribute('data-pvzol-inline-fullscreen'); } catch (e) {}
+        return 'inline-exit';
+    }
+
+    var nodes = document.querySelectorAll ? document.querySelectorAll('object, embed') : [];
+    for (var j = 0; j < nodes.length; j++) {
+        if (isMarked(nodes[j])) {
+            return exitInlineFullscreen(nodes[j]);
+        }
     }
 
     if (document.fullscreenElement || document.msFullscreenElement || document.webkitFullscreenElement) {
         if (document.exitFullscreen) { document.exitFullscreen(); return 'exit'; }
         if (document.msExitFullscreen) { document.msExitFullscreen(); return 'exit'; }
         if (document.webkitExitFullscreen) { document.webkitExitFullscreen(); return 'exit'; }
+    }
+
+    for (var i = 0; i < nodes.length; i++) {
+        if (tryNativeFullscreen(nodes[i])) return 'ok';
+        return enterInlineFullscreen(nodes[i]);
     }
 
     return 'missing';
@@ -2769,6 +2897,12 @@ namespace WebBrowserApp
                 {
                     case "ok":
                         UpdateStatus("已尝试让页面内 Flash 进入全屏");
+                        break;
+                    case "inline-enter":
+                        UpdateStatus("已切换到页面内 Flash 全屏");
+                        break;
+                    case "inline-exit":
+                        UpdateStatus("已退出页面内 Flash 全屏");
                         break;
                     case "exit":
                         UpdateStatus("已尝试退出页面内全屏");

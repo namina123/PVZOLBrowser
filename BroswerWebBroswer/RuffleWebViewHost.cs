@@ -18,6 +18,7 @@ namespace WebBrowserApp
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private bool _requestFilterAttached;
         private bool _consoleAttached;
+        private bool _clearCookiesOnInitialize;
 
         internal RuffleWebViewHost(Control parent, RuffleLocalProxy proxy)
         {
@@ -55,6 +56,11 @@ namespace WebBrowserApp
             }
 
             await _view.EnsureCoreWebView2Async().ConfigureAwait(true);
+            if (_clearCookiesOnInitialize)
+            {
+                DeleteAllWebViewCookiesIfPossible("initialization");
+                _clearCookiesOnInitialize = false;
+            }
             AttachRequestFilter();
             await AttachConsoleLoggingAsync().ConfigureAwait(true);
             AttachWindowInterception();
@@ -105,19 +111,12 @@ namespace WebBrowserApp
 
             if (_view.CoreWebView2 == null)
             {
-                RuntimeDiagnostics.Write("ruffle-cookie", "cleared pending cookies before webview initialization");
+                _clearCookiesOnInitialize = true;
+                RuntimeDiagnostics.Write("ruffle-cookie", "queued full webview2 cookie clear before initialization");
                 return;
             }
 
-            try
-            {
-                _view.CoreWebView2.CookieManager.DeleteAllCookies();
-                RuntimeDiagnostics.Write("ruffle-cookie", "cleared webview2 cookie jar before apply");
-            }
-            catch (Exception ex)
-            {
-                RuntimeDiagnostics.Write("ruffle-cookie", $"clear webview2 cookies failed error={ex.Message}");
-            }
+            DeleteAllWebViewCookiesIfPossible("runtime");
         }
 
         public void ApplyCookies(Uri targetUri, string cookieHeader)
@@ -505,6 +504,19 @@ namespace WebBrowserApp
             }
 
             _pendingCookies.Clear();
+        }
+
+        private void DeleteAllWebViewCookiesIfPossible(string reason)
+        {
+            try
+            {
+                _view.CoreWebView2.CookieManager.DeleteAllCookies();
+                RuntimeDiagnostics.Write("ruffle-cookie", $"cleared webview2 cookie jar reason={reason}");
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("ruffle-cookie", $"clear webview2 cookies failed reason={reason} error={ex.Message}");
+            }
         }
 
         private static Dictionary<string, string> ReadRequestHeaders(CoreWebView2HttpRequestHeaders headers)

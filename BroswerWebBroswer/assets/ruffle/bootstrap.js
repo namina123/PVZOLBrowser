@@ -227,15 +227,18 @@
             }
 
             var shouldForceProxy = /\/pvz\/amf\/?(\?.*)?$/i.test(parsed.pathname + parsed.search);
+            function buildManagedProxyUrl(proxyOrigin) {
+                return proxyOrigin
+                    + PROXY_ROOT
+                    + parsed.protocol.replace(":", "")
+                    + "/"
+                    + parsed.host
+                    + parsed.pathname
+                    + parsed.search;
+            }
             if (parsed.origin === window.location.origin) {
                 if (shouldForceProxy) {
-                    return (proxyBase || window.location.origin)
-                        + PROXY_ROOT
-                        + parsed.protocol.replace(":", "")
-                        + "/"
-                        + parsed.host
-                        + parsed.pathname
-                        + parsed.search;
+                    return buildManagedProxyUrl(proxyBase || window.location.origin);
                 }
                 return absoluteUrl;
             }
@@ -244,13 +247,7 @@
                 return absoluteUrl;
             }
 
-            return window.location.origin
-                + PROXY_ROOT
-                + parsed.protocol.replace(":", "")
-                + "/"
-                + parsed.host
-                + parsed.pathname
-                + parsed.search;
+            return buildManagedProxyUrl(window.location.origin);
         } catch (error) {
             return absoluteUrl;
         }

@@ -13,7 +13,7 @@ namespace WebBrowserApp
         private readonly Action<int> _toggleFavoriteAction;
         private readonly FlowLayoutPanel _buttonPanel;
         private readonly Label _subtitleLabel;
-        private const int PanelWidth = 208;
+        private const int PanelWidth = 220;
 
         internal ServerJumpPanel(Action<int> jumpAction, Action<int> toggleFavoriteAction, Action closeAction)
         {
@@ -61,7 +61,7 @@ namespace WebBrowserApp
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
                 ForeColor = Color.FromArgb(55, 65, 81),
-                Location = new Point(178, 0),
+                Location = new Point(188, 0),
                 Size = new Size(34, 30),
                 Text = "×",
                 UseVisualStyleBackColor = false
@@ -109,7 +109,7 @@ namespace WebBrowserApp
                 BackColor = Color.FromArgb(239, 246, 255),
                 Cursor = Cursors.Hand,
                 Margin = new Padding(0, 0, 0, 8),
-                Padding = new Padding(12, 8, 12, 8),
+                Padding = new Padding(12, 8, 8, 8),
                 Size = new Size(PanelWidth, 64),
                 Tag = zone
             };
@@ -155,7 +155,7 @@ namespace WebBrowserApp
                 ForeColor = isFavorite ? Color.FromArgb(217, 119, 6) : Color.FromArgb(156, 163, 175),
                 Margin = Padding.Empty,
                 Padding = Padding.Empty,
-                Size = new Size(26, 26),
+                Size = new Size(22, 22),
                 Text = isFavorite ? "★" : "☆",
                 UseVisualStyleBackColor = false
             };

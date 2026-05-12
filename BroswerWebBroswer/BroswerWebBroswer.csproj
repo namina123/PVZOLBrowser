@@ -84,6 +84,8 @@
     <Log4NetReferencePath Condition="Exists('..\packages\log4net.1.2.10\lib\2.0\log4net.dll')">..\packages\log4net.1.2.10\lib\2.0\log4net.dll</Log4NetReferencePath>
     <WebView2ReferenceRoot Condition="Exists('C:\Program Files\Microsoft OfficePLUS\3.16.0.46159\addin\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files\Microsoft OfficePLUS\3.16.0.46159\addin</WebView2ReferenceRoot>
     <WebView2ReferenceRoot Condition="'$(WebView2ReferenceRoot)' == '' and Exists('C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit</WebView2ReferenceRoot>
+    <WebView2ReferenceRoot Condition="'$(WebView2ReferenceRoot)' == '' and Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview</WebView2ReferenceRoot>
+    <WebView2ReferenceRoot Condition="'$(WebView2ReferenceRoot)' == '' and Exists('C:\Program Files\Git\mingw64\bin\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files\Git\mingw64\bin</WebView2ReferenceRoot>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="log4net, Version=1.2.10.0, Culture=neutral, PublicKeyToken=1b44e1d426115821, processorArchitecture=MSIL">

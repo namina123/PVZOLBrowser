@@ -1297,7 +1297,7 @@ namespace WebBrowserApp
 
             _serverJumpPanel = new ServerJumpPanel(HandleZoneJumpRequest, HandleZoneFavoriteToggle, HandleZoneJumpPanelClosed)
             {
-                Width = 216
+                Width = 236
             };
             _serverJumpPanel.SetOrderFilePath(_zoneOrderManager.FilePath);
         }
@@ -1314,11 +1314,11 @@ namespace WebBrowserApp
             {
                 AutoScaleMode = AutoScaleMode.Font,
                 BackColor = Color.White,
-                ClientSize = new Size(216, 420),
+                ClientSize = new Size(236, 420),
                 FormBorderStyle = FormBorderStyle.SizableToolWindow,
                 MaximizeBox = false,
                 MinimizeBox = false,
-                MinimumSize = new Size(216, 340),
+                MinimumSize = new Size(236, 340),
                 ShowIcon = false,
                 ShowInTaskbar = false,
                 StartPosition = FormStartPosition.Manual,

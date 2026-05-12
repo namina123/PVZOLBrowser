@@ -394,10 +394,21 @@ namespace WebBrowserApp
 
                 string method = e.Request.Method ?? "GET";
                 string requestPath = requestUri.AbsolutePath ?? "/";
+                bool isProxyAuthorityRequest =
+                    _proxy.BaseUri != null
+                    && string.Equals(requestUri.Authority, _proxy.BaseUri.Authority, StringComparison.OrdinalIgnoreCase);
                 bool isManagedPath =
                     requestPath.StartsWith("/__proxy__/", StringComparison.OrdinalIgnoreCase)
                     || requestPath.StartsWith("/__player__/", StringComparison.OrdinalIgnoreCase)
                     || requestPath.StartsWith("/__ruffle__/", StringComparison.OrdinalIgnoreCase);
+                if (isProxyAuthorityRequest
+                    && requestPath.StartsWith("/__proxy__/", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    RuntimeDiagnostics.Write("ruffle-amf", $"allow local proxy post pass-through url={requestUri}");
+                    return;
+                }
+
                 bool isAmfCandidate = IsAmfCandidateRequest(requestUri, method, e.Request.Headers);
                 if (!isManagedPath && string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && !isAmfCandidate)
                 {

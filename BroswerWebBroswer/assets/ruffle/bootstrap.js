@@ -216,6 +216,12 @@
 
         try {
             var parsed = new URL(absoluteUrl);
+            var proxyBase = "";
+            try {
+                proxyBase = String(window.__pvzolProxyBase || "").replace(/\/+$/, "");
+            } catch (proxyError) {
+                proxyBase = "";
+            }
             if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
                 return absoluteUrl;
             }
@@ -223,7 +229,7 @@
             var shouldForceProxy = /\/pvz\/amf\/?(\?.*)?$/i.test(parsed.pathname + parsed.search);
             if (parsed.origin === window.location.origin) {
                 if (shouldForceProxy) {
-                    return window.location.origin
+                    return (proxyBase || window.location.origin)
                         + PROXY_ROOT
                         + parsed.protocol.replace(":", "")
                         + "/"

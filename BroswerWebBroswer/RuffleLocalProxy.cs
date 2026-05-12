@@ -1510,6 +1510,9 @@ namespace WebBrowserApp
 
         private string BuildRuffleConfigScript()
         {
+            string proxyBase = BaseUri == null
+                ? "http://127.0.0.1"
+                : BaseUri.GetLeftPart(UriPartial.Authority);
             return "(function(){"
                 + "var ieUa='" + JavaScriptEscape(IeUserAgent) + "';"
                 + "try{Object.defineProperty(navigator,'userAgent',{get:function(){return ieUa;},configurable:true});}catch(e){}"
@@ -1522,6 +1525,7 @@ namespace WebBrowserApp
                 + "window.RufflePlayer.config=window.RufflePlayer.config||{};"
                 + "var c=window.RufflePlayer.config;"
                 + "window.__pvzolRuffleRoot='" + AssetPrefix + "';"
+                + "window.__pvzolProxyBase='" + JavaScriptEscape(proxyBase) + "';"
                 + "if(typeof window.__pvzolPreferredRenderer==='undefined'){"
                 + "if(window.navigator&&('gpu' in navigator)){window.__pvzolPreferredRenderer='webgpu';}"
                 + "else if(window.WebGLRenderingContext||window.WebGL2RenderingContext){window.__pvzolPreferredRenderer='wgpu-webgl';}"

@@ -13,7 +13,7 @@ namespace WebBrowserApp
         private readonly Action<int> _toggleFavoriteAction;
         private readonly FlowLayoutPanel _buttonPanel;
         private readonly Label _subtitleLabel;
-        private const int PanelWidth = 196;
+        private const int PanelWidth = 208;
 
         internal ServerJumpPanel(Action<int> jumpAction, Action<int> toggleFavoriteAction, Action closeAction)
         {
@@ -61,7 +61,7 @@ namespace WebBrowserApp
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
                 ForeColor = Color.FromArgb(55, 65, 81),
-                Location = new Point(166, 0),
+                Location = new Point(178, 0),
                 Size = new Size(34, 30),
                 Text = "×",
                 UseVisualStyleBackColor = false

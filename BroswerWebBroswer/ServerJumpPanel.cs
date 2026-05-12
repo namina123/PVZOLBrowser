@@ -13,7 +13,7 @@ namespace WebBrowserApp
         private readonly Action<int> _toggleFavoriteAction;
         private readonly FlowLayoutPanel _buttonPanel;
         private readonly Label _subtitleLabel;
-        private const int PanelWidth = 184;
+        private const int PanelWidth = 196;
 
         internal ServerJumpPanel(Action<int> jumpAction, Action<int> toggleFavoriteAction, Action closeAction)
         {

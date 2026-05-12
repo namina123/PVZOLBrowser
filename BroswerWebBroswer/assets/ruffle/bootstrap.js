@@ -220,7 +220,17 @@
                 return absoluteUrl;
             }
 
+            var shouldForceProxy = /\/pvz\/amf\/?(\?.*)?$/i.test(parsed.pathname + parsed.search);
             if (parsed.origin === window.location.origin) {
+                if (shouldForceProxy) {
+                    return window.location.origin
+                        + PROXY_ROOT
+                        + parsed.protocol.replace(":", "")
+                        + "/"
+                        + parsed.host
+                        + parsed.pathname
+                        + parsed.search;
+                }
                 return absoluteUrl;
             }
 

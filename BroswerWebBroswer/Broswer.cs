@@ -1428,6 +1428,8 @@ namespace WebBrowserApp
                 return;
             }
 
+            ClearBrowserCookies();
+
             if (_browserMode == BrowserBackendMode.RuffleWebView2)
             {
                 _ruffleHost?.ApplyCookies(rootUri, cookieHeader);

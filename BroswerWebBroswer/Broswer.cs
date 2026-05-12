@@ -2968,6 +2968,39 @@ namespace WebBrowserApp
 
         private sealed class CookieManager
         {
+            private static readonly string[] RelevantUrlKeywords =
+            {
+                "pvz",
+                "youkia",
+                "pvzol"
+            };
+
+            private static readonly string[] KnownRelevantUrls =
+            {
+                "http://youkia.com/",
+                "http://youkia.com/index.php",
+                "http://pvz.youkia.com/",
+                "http://pvz.youkia.com/index.php",
+                "http://pvz.youkia.com/pvz/index.php/default/main",
+                "http://www.youkia.com/",
+                "http://www.youkia.com/index.php",
+                "http://www.youkia.com/pvz/index.php/default/main",
+                "http://pvzol.org/",
+                "http://pvzol.org/pvz/index.php/default/main"
+            };
+
+            private static readonly string[] RelevantCookiePaths =
+            {
+                "/",
+                "/index.php",
+                "/index.php/pvz",
+                "/pvz",
+                "/pvz/",
+                "/pvz/index.php",
+                "/pvz/index.php/default",
+                "/pvz/index.php/default/main"
+            };
+
             [DllImport("wininet.dll", CharSet = CharSet.Auto, SetLastError = true)]
             private static extern bool InternetSetCookie(string lpszUrlName, string lpszCookieName, string lpszCookieData);
 
@@ -3028,13 +3061,23 @@ namespace WebBrowserApp
             {
                 InternetSetOption(IntPtr.Zero, InternetOptionEndBrowserSession, IntPtr.Zero, 0);
 
-                foreach (string url in _appliedUrls.ToList())
+                var cleanupUrls = CollectRelevantCleanupUrls();
+                var cookieNames = new HashSet<string>(_appliedCookieNames, StringComparer.OrdinalIgnoreCase);
+                foreach (string url in cleanupUrls)
                 {
-                    foreach (string cookieName in _appliedCookieNames)
+                    foreach (string cookieName in ReadCookieNamesForUrl(url))
+                    {
+                        cookieNames.Add(cookieName);
+                    }
+                }
+
+                foreach (string url in cleanupUrls)
+                {
+                    foreach (string cookieName in cookieNames)
                     {
                         try
                         {
-                            InternetSetCookie(url, cookieName, "deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/");
+                            ExpireCookieAcrossRelevantScopes(url, cookieName);
                         }
                         catch
                         {
@@ -3073,6 +3116,181 @@ namespace WebBrowserApp
                     _appliedUrls.Add(absoluteUrl);
                     _appliedCookieNames.Add(cookieName);
                 }
+            }
+
+            private HashSet<string> CollectRelevantCleanupUrls()
+            {
+                var cleanupUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string knownUrl in KnownRelevantUrls)
+                {
+                    if (IsRelevantCookieUrl(knownUrl))
+                    {
+                        cleanupUrls.Add(knownUrl);
+                    }
+                }
+
+                foreach (string appliedUrl in _appliedUrls)
+                {
+                    if (!Uri.TryCreate(appliedUrl, UriKind.Absolute, out Uri parsedAppliedUri))
+                    {
+                        continue;
+                    }
+
+                    foreach (string candidate in BuildRelevantUrlVariants(parsedAppliedUri))
+                    {
+                        cleanupUrls.Add(candidate);
+                    }
+                }
+
+                if (_currentDomain != null)
+                {
+                    foreach (string candidate in BuildRelevantUrlVariants(_currentDomain))
+                    {
+                        cleanupUrls.Add(candidate);
+                    }
+                }
+
+                return cleanupUrls;
+            }
+
+            private static IEnumerable<string> BuildRelevantUrlVariants(Uri uri)
+            {
+                if (uri == null)
+                {
+                    yield break;
+                }
+
+                if (IsRelevantCookieUrl(uri.AbsoluteUri))
+                {
+                    yield return uri.AbsoluteUri;
+                }
+
+                string authority = uri.GetLeftPart(UriPartial.Authority);
+                foreach (string suffix in new[]
+                {
+                    "/",
+                    "/index.php",
+                    "/pvz/index.php/default/main"
+                })
+                {
+                    string candidate = authority + suffix;
+                    if (IsRelevantCookieUrl(candidate))
+                    {
+                        yield return candidate;
+                    }
+                }
+            }
+
+            private static bool IsRelevantCookieUrl(string url)
+            {
+                string lower = (url ?? string.Empty).Trim().ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(lower))
+                {
+                    return false;
+                }
+
+                return RelevantUrlKeywords.Any(keyword => lower.Contains(keyword));
+            }
+
+            private static IEnumerable<string> ReadCookieNamesForUrl(string url)
+            {
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    yield break;
+                }
+
+                int size = 8192;
+                var builder = new StringBuilder(size);
+                bool ok = Browser.InternetGetCookieEx(url, null, builder, ref size, Browser.InternetCookieHttpOnly, IntPtr.Zero);
+                if (!ok && size > 0)
+                {
+                    builder = new StringBuilder(size);
+                    ok = Browser.InternetGetCookieEx(url, null, builder, ref size, Browser.InternetCookieHttpOnly, IntPtr.Zero);
+                }
+
+                if (!ok)
+                {
+                    yield break;
+                }
+
+                foreach (string segment in builder.ToString().Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    string trimmed = (segment ?? string.Empty).Trim();
+                    int equalsIndex = trimmed.IndexOf('=');
+                    if (equalsIndex <= 0)
+                    {
+                        continue;
+                    }
+
+                    string name = trimmed.Substring(0, equalsIndex).Trim();
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        yield return name;
+                    }
+                }
+            }
+
+            private static void ExpireCookieAcrossRelevantScopes(string url, string cookieName)
+            {
+                if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(cookieName))
+                {
+                    return;
+                }
+
+                if (!Uri.TryCreate(url, UriKind.Absolute, out Uri targetUri))
+                {
+                    return;
+                }
+
+                foreach (string domain in BuildRelevantCookieDomains(targetUri.Host))
+                {
+                    foreach (string path in RelevantCookiePaths)
+                    {
+                        try
+                        {
+                            string cookieData = string.IsNullOrWhiteSpace(domain)
+                                ? $"{cookieName}=deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path={path}"
+                                : $"{cookieName}=deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path={path};domain={domain}";
+                            InternetSetCookie(url, null, cookieData);
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            }
+
+            private static IEnumerable<string> BuildRelevantCookieDomains(string host)
+            {
+                var domains = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    null,
+                    string.Empty
+                };
+
+                string normalizedHost = (host ?? string.Empty).Trim().ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(normalizedHost))
+                {
+                    return domains;
+                }
+
+                domains.Add(normalizedHost);
+                domains.Add("." + normalizedHost);
+
+                string[] parts = normalizedHost.Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 1; i < parts.Length - 1; i++)
+                {
+                    string suffix = string.Join(".", parts.Skip(i));
+                    if (!IsRelevantCookieUrl(suffix))
+                    {
+                        continue;
+                    }
+
+                    domains.Add(suffix);
+                    domains.Add("." + suffix);
+                }
+
+                return domains;
             }
         }
 

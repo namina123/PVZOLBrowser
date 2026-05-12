@@ -2303,7 +2303,7 @@ namespace WebBrowserApp
                         RuntimeDiagnostics.Write(
                             "cookie-save",
                             $"skip prompt because equivalent local cookie already exists source={match.SourceUri} rule={match.Rule}");
-                        return null;
+                        continue;
                     }
 
                     return match;

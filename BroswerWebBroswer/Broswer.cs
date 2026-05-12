@@ -36,6 +36,7 @@ namespace WebBrowserApp
         private readonly LocalMappingRuleSet _localMappingRules;
         private readonly List<string> _cookieFiles = new List<string>();
         private readonly List<CookieDisplayEntry> _cookieDisplayEntries = new List<CookieDisplayEntry>();
+        private readonly HashSet<string> _cookieProfileSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Timer _zoneJumpSavePollTimer;
         private readonly Timer _cookieImportToastTimer;
 
@@ -327,7 +328,23 @@ namespace WebBrowserApp
                 _cookieFiles.Clear();
                 _cookieFiles.AddRange(_cookieProfileManager.LoadProfileFiles());
                 _cookieDisplayEntries.Clear();
-                foreach (CookieDisplayEntry entry in BuildCookieDisplayEntries(_cookieFiles))
+                _cookieProfileSignatures.Clear();
+
+                var profiles = new List<Tuple<string, CookieProfileManager.CookieProfile, string>>();
+                foreach (string file in _cookieFiles)
+                {
+                    CookieProfileManager.CookieProfile profile = _cookieProfileManager.LoadProfile(file);
+                    string signature = profile == null
+                        ? "file:" + file
+                        : CookieProfileManager.BuildProfileSignature(profile);
+                    profiles.Add(Tuple.Create(file, profile, signature));
+                    if (profile != null && !string.IsNullOrWhiteSpace(signature))
+                    {
+                        _cookieProfileSignatures.Add(signature);
+                    }
+                }
+
+                foreach (CookieDisplayEntry entry in BuildCookieDisplayEntries(profiles))
                 {
                     _cookieDisplayEntries.Add(entry);
                 }
@@ -339,19 +356,11 @@ namespace WebBrowserApp
             });
         }
 
-        private IEnumerable<CookieDisplayEntry> BuildCookieDisplayEntries(IEnumerable<string> files)
+        private IEnumerable<CookieDisplayEntry> BuildCookieDisplayEntries(
+            IEnumerable<Tuple<string, CookieProfileManager.CookieProfile, string>> profiles)
         {
-            var groups = new List<Tuple<string, CookieProfileManager.CookieProfile, string>>();
-            foreach (string file in files ?? Enumerable.Empty<string>())
-            {
-                CookieProfileManager.CookieProfile profile = _cookieProfileManager.LoadProfile(file);
-                string signature = profile == null
-                    ? "file:" + file
-                    : CookieProfileManager.BuildProfileSignature(profile);
-                groups.Add(Tuple.Create(file, profile, signature));
-            }
-
-            foreach (IGrouping<string, Tuple<string, CookieProfileManager.CookieProfile, string>> group in groups.GroupBy(item => item.Item3))
+            foreach (IGrouping<string, Tuple<string, CookieProfileManager.CookieProfile, string>> group in
+                (profiles ?? Enumerable.Empty<Tuple<string, CookieProfileManager.CookieProfile, string>>()).GroupBy(item => item.Item3))
             {
                 Tuple<string, CookieProfileManager.CookieProfile, string> first = group.First();
                 List<string> filePaths = group.Select(item => item.Item1).ToList();
@@ -1041,6 +1050,10 @@ namespace WebBrowserApp
             Uri currentUri = GetCurrentPageUri();
             if (currentUri == null || !ShouldPollZoneJump(currentUri))
             {
+                _zoneJumpAvailable = false;
+                _zoneJumpAvailabilityKey = string.Empty;
+                btnZoneJump.Enabled = false;
+                ShowZoneJumpPanel(false);
                 return;
             }
 
@@ -1484,11 +1497,8 @@ namespace WebBrowserApp
                 {
                     _zoneJumpAvailable = false;
                     _zoneJumpAvailabilityKey = string.Empty;
-                    btnZoneJump.Enabled = popupVisible;
-                    if (!popupVisible)
-                    {
-                        ShowZoneJumpPanel(false);
-                    }
+                    btnZoneJump.Enabled = false;
+                    ShowZoneJumpPanel(false);
                     return;
                 }
 
@@ -2288,11 +2298,30 @@ namespace WebBrowserApp
                     $"probe page={currentUri} candidate={candidateUri} cookieLength={(cookieHeader ?? string.Empty).Length} matched={(match != null)}");
                 if (match != null)
                 {
+                    if (HasEquivalentSavedCookieProfile(match))
+                    {
+                        RuntimeDiagnostics.Write(
+                            "cookie-save",
+                            $"skip prompt because equivalent local cookie already exists source={match.SourceUri} rule={match.Rule}");
+                        return null;
+                    }
+
                     return match;
                 }
             }
 
             return null;
+        }
+
+        private bool HasEquivalentSavedCookieProfile(CookieProfileManager.SaveCookieMatch match)
+        {
+            string targetSignature = CookieProfileManager.BuildSaveCookieMatchSignature(match);
+            if (string.IsNullOrWhiteSpace(targetSignature))
+            {
+                return false;
+            }
+
+            return _cookieProfileSignatures.Contains(targetSignature);
         }
 
         private async Task<string> GetCookieHeaderForCandidateAsync(Uri currentUri, Uri candidateUri)

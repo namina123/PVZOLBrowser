@@ -324,6 +324,18 @@ namespace WebBrowserApp
             return (domain + "|" + cookieBody).Trim();
         }
 
+        internal static string BuildSaveCookieMatchSignature(SaveCookieMatch match)
+        {
+            if (match == null)
+            {
+                return string.Empty;
+            }
+
+            string domain = NormalizeRootUrl(match.UserDomain) ?? string.Empty;
+            string cookieBody = NormalizeCookieHeader(match.PersistedCookies);
+            return (domain + "|" + cookieBody).Trim();
+        }
+
         private CookieProfile ParseProfileText(string rawText, string filePath)
         {
             if (string.IsNullOrWhiteSpace(rawText))

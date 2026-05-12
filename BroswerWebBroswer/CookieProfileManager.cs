@@ -318,10 +318,7 @@ namespace WebBrowserApp
                 return string.Empty;
             }
 
-            string domain = NormalizeRootUrl(profile.UserDomain) ?? string.Empty;
-            CookieApplicationPlan plan = BuildCookieApplicationPlan(profile.UserCookies);
-            string cookieBody = plan == null ? string.Empty : NormalizeCookieHeader(plan.CookieHeader);
-            return (domain + "|" + cookieBody).Trim();
+            return BuildCookieComparisonSignature(profile.UserDomain, profile.UserCookies);
         }
 
         internal static string BuildSaveCookieMatchSignature(SaveCookieMatch match)
@@ -331,9 +328,24 @@ namespace WebBrowserApp
                 return string.Empty;
             }
 
-            string domain = NormalizeRootUrl(match.UserDomain) ?? string.Empty;
-            string cookieBody = NormalizeCookieHeader(match.PersistedCookies);
-            return (domain + "|" + cookieBody).Trim();
+            return BuildCookieComparisonSignature(match.UserDomain, match.PersistedCookies);
+        }
+
+        internal static string BuildCookieComparisonSignature(string rawDomainOrUrl, string rawCookies)
+        {
+            string normalizedUrl = NormalizeSignatureUrl(rawDomainOrUrl);
+            if (string.IsNullOrWhiteSpace(normalizedUrl))
+            {
+                return string.Empty;
+            }
+
+            string keySignature = BuildImportantCookieSignature(rawCookies);
+            if (string.IsNullOrWhiteSpace(keySignature))
+            {
+                return string.Empty;
+            }
+
+            return normalizedUrl + "|" + keySignature;
         }
 
         private CookieProfile ParseProfileText(string rawText, string filePath)
@@ -543,6 +555,17 @@ namespace WebBrowserApp
             }
 
             return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+        }
+
+        private static string NormalizeSignatureUrl(string value)
+        {
+            string rootUrl = NormalizeRootUrl(value);
+            if (string.IsNullOrWhiteSpace(rootUrl))
+            {
+                return string.Empty;
+            }
+
+            return rootUrl.TrimEnd('/') + "/";
         }
 
         private static string BuildDefaultProfileName()
@@ -831,6 +854,69 @@ namespace WebBrowserApp
             return string.Join("; ", SplitCookieEntries(rawCookies)
                 .Select(entry => entry.Trim())
                 .Distinct(StringComparer.OrdinalIgnoreCase));
+        }
+
+        private static string BuildImportantCookieSignature(string rawCookies)
+        {
+            List<string> entries = SplitCookieEntries(rawCookies);
+            if (entries.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            string phpSession = null;
+            string pvzYoukiaNew1 = null;
+            string pvzol = null;
+
+            foreach (string entry in entries)
+            {
+                string key = GetCookieKey(entry);
+                if (string.IsNullOrWhiteSpace(key))
+                {
+                    continue;
+                }
+
+                if (phpSession == null && string.Equals(key, CookieKeyPhpSessionId, StringComparison.OrdinalIgnoreCase))
+                {
+                    phpSession = NormalizeCookieEntry(entry);
+                    continue;
+                }
+
+                if (pvzYoukiaNew1 == null && string.Equals(key, CookieKeyPvzYoukiaNew1, StringComparison.OrdinalIgnoreCase))
+                {
+                    pvzYoukiaNew1 = NormalizeCookieEntry(entry);
+                    continue;
+                }
+
+                if (pvzol == null && string.Equals(key, CookieKeyPvzol, StringComparison.OrdinalIgnoreCase))
+                {
+                    pvzol = NormalizeCookieEntry(entry);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(phpSession) && !string.IsNullOrWhiteSpace(pvzYoukiaNew1))
+            {
+                return "youkia-strong|" + phpSession + "|" + pvzYoukiaNew1;
+            }
+
+            if (!string.IsNullOrWhiteSpace(pvzol))
+            {
+                return "pvzol|" + pvzol;
+            }
+
+            return string.Empty;
+        }
+
+        private static string NormalizeCookieEntry(string entry)
+        {
+            string key = GetCookieKey(entry);
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                return string.Empty;
+            }
+
+            string value = GetCookieValue(entry) ?? string.Empty;
+            return SafeLower(key) + "=" + value.Trim();
         }
 
         private static bool IsYoukiaRuntimeHost(string host)

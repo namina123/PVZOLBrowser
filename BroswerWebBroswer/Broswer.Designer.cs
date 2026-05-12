@@ -8,7 +8,9 @@ namespace WebBrowserApp
         private System.ComponentModel.IContainer components = null;
 
         private Panel pnlTopBar;
+        private Button btnZoneJump;
         private Button btnGo;
+        private Button btnSaveCookie;
         private TextBox txtUrl;
         private Button btnHome;
         private Button btnRefresh;
@@ -24,7 +26,9 @@ namespace WebBrowserApp
         private void InitializeComponent()
         {
             this.pnlTopBar = new System.Windows.Forms.Panel();
+            this.btnZoneJump = new System.Windows.Forms.Button();
             this.btnGo = new System.Windows.Forms.Button();
+            this.btnSaveCookie = new System.Windows.Forms.Button();
             this.txtUrl = new System.Windows.Forms.TextBox();
             this.btnHome = new System.Windows.Forms.Button();
             this.btnRefresh = new System.Windows.Forms.Button();
@@ -45,7 +49,9 @@ namespace WebBrowserApp
             // pnlTopBar
             // 
             this.pnlTopBar.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(248)))), ((int)(((byte)(250)))), ((int)(((byte)(252)))));
+            this.pnlTopBar.Controls.Add(this.btnZoneJump);
             this.pnlTopBar.Controls.Add(this.btnGo);
+            this.pnlTopBar.Controls.Add(this.btnSaveCookie);
             this.pnlTopBar.Controls.Add(this.txtUrl);
             this.pnlTopBar.Controls.Add(this.btnHome);
             this.pnlTopBar.Controls.Add(this.btnRefresh);
@@ -55,6 +61,23 @@ namespace WebBrowserApp
             this.pnlTopBar.Padding = new System.Windows.Forms.Padding(12, 10, 12, 10);
             this.pnlTopBar.Size = new System.Drawing.Size(1160, 56);
             this.pnlTopBar.TabIndex = 0;
+            // 
+            // btnZoneJump
+            // 
+            this.btnZoneJump.BackColor = System.Drawing.Color.White;
+            this.btnZoneJump.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnZoneJump.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(209)))), ((int)(((byte)(213)))), ((int)(((byte)(219)))));
+            this.btnZoneJump.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(((int)(((byte)(243)))), ((int)(((byte)(244)))), ((int)(((byte)(246)))));
+            this.btnZoneJump.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnZoneJump.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Bold);
+            this.btnZoneJump.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(65)))), ((int)(((byte)(81)))));
+            this.btnZoneJump.Location = new System.Drawing.Point(12, 10);
+            this.btnZoneJump.Name = "btnZoneJump";
+            this.btnZoneJump.Size = new System.Drawing.Size(46, 34);
+            this.btnZoneJump.TabIndex = 0;
+            this.btnZoneJump.Text = "<=";
+            this.btnZoneJump.UseVisualStyleBackColor = false;
+            this.btnZoneJump.Click += new System.EventHandler(this.BtnZoneJump_Click);
             // 
             // btnGo
             // 
@@ -67,13 +90,31 @@ namespace WebBrowserApp
             this.btnGo.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnGo.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F, System.Drawing.FontStyle.Bold);
             this.btnGo.ForeColor = System.Drawing.Color.White;
-            this.btnGo.Location = new System.Drawing.Point(977, 10);
+            this.btnGo.Location = new System.Drawing.Point(849, 10);
             this.btnGo.Name = "btnGo";
-            this.btnGo.Size = new System.Drawing.Size(82, 34);
+            this.btnGo.Size = new System.Drawing.Size(50, 34);
             this.btnGo.TabIndex = 3;
             this.btnGo.Text = "前往";
             this.btnGo.UseVisualStyleBackColor = false;
             this.btnGo.Click += new System.EventHandler(this.BtnGo_Click);
+            // 
+            // btnSaveCookie
+            // 
+            this.btnSaveCookie.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.btnSaveCookie.BackColor = System.Drawing.Color.White;
+            this.btnSaveCookie.Cursor = System.Windows.Forms.Cursors.Hand;
+            this.btnSaveCookie.FlatAppearance.BorderColor = System.Drawing.Color.FromArgb(((int)(((byte)(209)))), ((int)(((byte)(213)))), ((int)(((byte)(219)))));
+            this.btnSaveCookie.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(((int)(((byte)(243)))), ((int)(((byte)(244)))), ((int)(((byte)(246)))));
+            this.btnSaveCookie.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnSaveCookie.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
+            this.btnSaveCookie.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(65)))), ((int)(((byte)(81)))));
+            this.btnSaveCookie.Location = new System.Drawing.Point(907, 10);
+            this.btnSaveCookie.Name = "btnSaveCookie";
+            this.btnSaveCookie.Size = new System.Drawing.Size(152, 34);
+            this.btnSaveCookie.TabIndex = 4;
+            this.btnSaveCookie.Text = "保存当前cookie到本地";
+            this.btnSaveCookie.UseVisualStyleBackColor = false;
+            this.btnSaveCookie.Click += new System.EventHandler(this.BtnSaveCookie_Click);
             // 
             // txtUrl
             // 
@@ -82,10 +123,10 @@ namespace WebBrowserApp
             this.txtUrl.BackColor = System.Drawing.Color.White;
             this.txtUrl.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
             this.txtUrl.Font = new System.Drawing.Font("Microsoft YaHei UI", 10F);
-            this.txtUrl.Location = new System.Drawing.Point(181, 13);
+            this.txtUrl.Location = new System.Drawing.Point(235, 13);
             this.txtUrl.Name = "txtUrl";
-            this.txtUrl.Size = new System.Drawing.Size(781, 25);
-            this.txtUrl.TabIndex = 2;
+            this.txtUrl.Size = new System.Drawing.Size(606, 25);
+            this.txtUrl.TabIndex = 1;
             this.txtUrl.KeyDown += new System.Windows.Forms.KeyEventHandler(this.TxtUrl_KeyDown);
             // 
             // btnHome
@@ -97,7 +138,7 @@ namespace WebBrowserApp
             this.btnHome.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnHome.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
             this.btnHome.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(65)))), ((int)(((byte)(81)))));
-            this.btnHome.Location = new System.Drawing.Point(96, 10);
+            this.btnHome.Location = new System.Drawing.Point(150, 10);
             this.btnHome.Name = "btnHome";
             this.btnHome.Size = new System.Drawing.Size(72, 34);
             this.btnHome.TabIndex = 1;
@@ -114,7 +155,7 @@ namespace WebBrowserApp
             this.btnRefresh.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
             this.btnRefresh.Font = new System.Drawing.Font("Microsoft YaHei UI", 9F);
             this.btnRefresh.ForeColor = System.Drawing.Color.FromArgb(((int)(((byte)(55)))), ((int)(((byte)(65)))), ((int)(((byte)(81)))));
-            this.btnRefresh.Location = new System.Drawing.Point(12, 10);
+            this.btnRefresh.Location = new System.Drawing.Point(66, 10);
             this.btnRefresh.Name = "btnRefresh";
             this.btnRefresh.Size = new System.Drawing.Size(72, 34);
             this.btnRefresh.TabIndex = 0;
@@ -241,7 +282,7 @@ namespace WebBrowserApp
             this.MinimumSize = new System.Drawing.Size(1000, 640);
             this.Name = "Browser";
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
-            this.Text = "PVZOL 浏览器";
+            this.Text = "交流群：1056704960  更多攻略和实用软件等可加群自行下载";
             this.pnlTopBar.ResumeLayout(false);
             this.pnlTopBar.PerformLayout();
             this.pnlRightTools.ResumeLayout(false);

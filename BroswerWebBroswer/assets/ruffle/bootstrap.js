@@ -133,10 +133,33 @@
         style.id = "__ruffle_compat_style__";
         style.textContent =
             "html,body{max-width:100%;overflow:auto !important;}" +
+            ".pvzol-ruffle-windowed-fullscreen{" +
+            "position:fixed !important;" +
+            "left:0 !important;" +
+            "top:0 !important;" +
+            "width:100vw !important;" +
+            "height:100vh !important;" +
+            "min-width:100vw !important;" +
+            "max-width:100vw !important;" +
+            "min-height:100vh !important;" +
+            "max-height:100vh !important;" +
+            "margin:0 !important;" +
+            "z-index:2147483000 !important;" +
+            "background:#000 !important;" +
+            "}" +
+            ".pvzol-ruffle-windowed-fullscreen ruffle-player," +
+            ".pvzol-ruffle-windowed-fullscreen ruffle-embed," +
+            ".pvzol-ruffle-windowed-fullscreen ruffle-object{" +
+            "width:100% !important;" +
+            "height:100% !important;" +
+            "min-width:100% !important;" +
+            "max-width:100% !important;" +
+            "min-height:100% !important;" +
+            "max-height:100% !important;" +
+            "}" +
             "ruffle-player,ruffle-embed,ruffle-object,object,embed{" +
             "display:block !important;" +
             "margin:0 auto !important;" +
-            "max-width:100% !important;" +
             "box-sizing:border-box !important;" +
             "}" +
             "ruffle-player canvas,ruffle-embed canvas,ruffle-object canvas{" +
@@ -163,7 +186,9 @@
             var height = rawHeight ? parseFloat(String(rawHeight).replace(/[^\d.]/g, "")) : 0;
 
             if (width > 0 && height > 0) {
-                element.style.width = "min(100%, " + width + "px)";
+                element.style.width = String(Math.round(width)) + "px";
+                element.style.minWidth = String(Math.round(width)) + "px";
+                element.style.maxWidth = String(Math.round(width)) + "px";
                 element.style.height = String(Math.round(height)) + "px";
                 element.style.minHeight = String(Math.round(height)) + "px";
                 element.style.maxHeight = String(Math.round(height)) + "px";
@@ -425,12 +450,11 @@
         host.setAttribute("data-pvzol-ruffle-managed", "1");
         host.style.display = "block";
         host.style.margin = "0 auto";
-        host.style.maxWidth = "100%";
         host.style.boxSizing = "border-box";
 
         var rawStyle = element.getAttribute("style");
         if (rawStyle) {
-            host.setAttribute("style", rawStyle + ";display:block;max-width:100%;box-sizing:border-box;");
+            host.setAttribute("style", rawStyle + ";display:block;box-sizing:border-box;");
         }
 
         var width = cssDimensionValue(element.getAttribute("width"), element.clientWidth);
@@ -438,7 +462,8 @@
         var fixedHeight = pixelDimensionValue(element.getAttribute("height"), element.clientHeight);
         if (width) {
             host.style.width = width;
-            host.style.maxWidth = width.indexOf("%") >= 0 ? width : "min(100%, " + width + ")";
+            host.style.minWidth = width;
+            host.style.maxWidth = width;
         }
         if (height) {
             host.style.height = fixedHeight || height;
@@ -573,10 +598,11 @@
         var host = createReplacementHost(element, originalUrl, proxyUrl);
         try {
             var player = factory.createPlayer();
-            player.style.width = "100%";
-            player.style.height = "100%";
+            player.style.width = host.style.width || element.style.width || "";
+            player.style.height = host.style.height || element.style.height || "";
             player.style.display = "block";
-            player.style.maxWidth = "100%";
+            player.style.minWidth = host.style.minWidth || "";
+            player.style.maxWidth = host.style.maxWidth || "";
             player.style.minHeight = host.style.minHeight || "";
             player.style.maxHeight = host.style.maxHeight || "";
             applyFlashMetadata(player, originalUrl, proxyUrl);
@@ -699,6 +725,18 @@
             subtree: true
         });
     }
+
+    function toggleWindowedFullscreen() {
+        var host = document.querySelector(".pvzol-ruffle-host, .game-container");
+        if (!host) {
+            return "missing";
+        }
+
+        host.classList.toggle("pvzol-ruffle-windowed-fullscreen");
+        return host.classList.contains("pvzol-ruffle-windowed-fullscreen") ? "enter" : "exit";
+    }
+
+    window.__pvzolToggleEmbeddedFullscreen = toggleWindowedFullscreen;
 
     function collectFlashProxyUrls(root) {
         var results = [];

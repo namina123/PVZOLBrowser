@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Xml.Linq;
@@ -14,7 +17,17 @@ namespace WebBrowserApp
 {
     public partial class Browser : Form
     {
-        private const string DefaultHome = "http://pvzol.org/pvz/index.php/default/main";
+        [DllImport("wininet.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern bool InternetGetCookieEx(
+            string url,
+            string cookieName,
+            StringBuilder cookieData,
+            ref int size,
+            int flags,
+            IntPtr reserved);
+
+        private const int InternetCookieHttpOnly = 0x00002000;
+        private const string DefaultHome = "http://pvz.youkia.com";
         private static readonly string[] MappingHosts =
         {
             "pvzol.org",
@@ -32,8 +45,13 @@ namespace WebBrowserApp
         };
 
         private readonly CookieManager _cookieManager;
+        private readonly CookieProfileManager _cookieProfileManager;
         private readonly ProxyManager _proxyManager;
+        private readonly ZoneOrderManager _zoneOrderManager;
         private readonly List<string> _cookieFiles = new List<string>();
+        private readonly List<CookieDisplayEntry> _cookieDisplayEntries = new List<CookieDisplayEntry>();
+        private readonly Timer _zoneJumpSavePollTimer;
+        private readonly Timer _cookieImportToastTimer;
 
         private FileSystemWatcher watcher;
         private ProxySettings _settings = new ProxySettings();
@@ -52,15 +70,54 @@ namespace WebBrowserApp
         private readonly bool _legacyDirectMode;
         private bool _shutdownCleanupStarted;
         private bool _allowImmediateClose;
+        private Color _cookieToolDefaultBackColor;
+        private ServerJumpPanel _serverJumpPanel;
+        private Form _serverJumpForm;
+        private bool _zoneJumpAvailable;
+        private bool _zoneJumpPanelManuallyHidden;
+        private string _zoneJumpAvailabilityKey = string.Empty;
+        private string _zoneJumpOrderSignature = string.Empty;
+        private int _zoneJumpRefreshVersion;
+        private bool _zoneJumpRefreshInFlight;
+        private readonly Timer _zoneJumpMonitorTimer;
+        private string _lastPopupTargetUrl = string.Empty;
+        private Panel _cookieImportToastPanel;
+        private Label _cookieImportToastLabel;
+        private Panel _zoneJumpSavePromptPanel;
+        private Label _zoneJumpSavePromptLabel;
+        private CookieProfileManager.SaveCookieMatch _pendingZoneJumpSaveMatch;
+        private string _pendingZoneJumpTargetUrl = string.Empty;
+        private bool _pendingZoneJumpRetryAvailable;
+        private bool _pendingZoneJumpRetryConsumed;
+        private bool _zoneJumpSavePollInFlight;
 
         public Browser()
         {
             InitializeComponent();
 
             _cookieManager = new CookieManager();
+            _cookieProfileManager = new CookieProfileManager(AppDomain.CurrentDomain.BaseDirectory);
             _proxyManager = new ProxyManager();
+            _zoneOrderManager = new ZoneOrderManager(AppDomain.CurrentDomain.BaseDirectory);
             _originalProxySnapshot = _proxyManager.CaptureCurrentProxy();
             _legacyDirectMode = BrowserBackendSelector.IsLegacyWindowsOnly();
+            _cookieToolDefaultBackColor = btnCookieTool.BackColor;
+            _zoneJumpMonitorTimer = new Timer { Interval = 1000 };
+            _zoneJumpSavePollTimer = new Timer { Interval = 500 };
+            _cookieImportToastTimer = new Timer { Interval = 3500 };
+            webBrowser.ObjectForScripting = new BrowserScriptBridge(this);
+
+            InitializeCookieImportDragDrop();
+            InitializeZoneJumpUi();
+            InitializeTopBarLayout();
+            InitializeZoneJumpMonitor();
+            InitializeJumpSavePromptUi();
+            InitializeCookieImportToastUi();
+            webBrowser.NewWindow += WebBrowser_NewWindow;
+            webBrowser.Navigating += WebBrowser_Navigating;
+            webBrowser.DocumentCompleted += WebBrowser_DocumentCompleted;
+            _zoneJumpSavePollTimer.Tick += ZoneJumpSavePollTimer_Tick;
+            _cookieImportToastTimer.Tick += CookieImportToastTimer_Tick;
 
             InitializeCookieLibrary();
             if (!_legacyDirectMode)
@@ -71,14 +128,24 @@ namespace WebBrowserApp
 
             Shown += Browser_Shown;
             FormClosing += Browser_FormClosing;
+            Resize += Browser_Resize;
         }
 
         private void Browser_Shown(object sender, EventArgs e)
         {
+            LayoutTopBarControls();
+            PositionCookieImportToast();
             if (_cookieSelectionForm == null || _cookieSelectionForm.IsDisposed)
             {
                 BtnCookieTool_Click(btnCookieTool, EventArgs.Empty);
             }
+        }
+
+        private void Browser_Resize(object sender, EventArgs e)
+        {
+            PositionCookieImportToast();
+            PositionZoneJumpSavePrompt();
+            UpdateZoneJumpPopupPlacement();
         }
 
         private void InitializeBrowserSettings()
@@ -134,6 +201,7 @@ namespace WebBrowserApp
                 _ruffleHost = CreateRuffleHost();
                 _ruffleHost.SourceChanged += RuffleHost_SourceChanged;
                 _ruffleHost.NavigationCompleted += RuffleHost_NavigationCompleted;
+                _ruffleHost.NewWindowRequested += RuffleHost_NewWindowRequested;
             }
 
             webBrowser.Visible = false;
@@ -181,18 +249,12 @@ namespace WebBrowserApp
 
         private IRuffleBrowserHost CreateRuffleHost()
         {
-            Type hostType = typeof(Browser).Assembly.GetType("WebBrowserApp.RuffleWebViewHost", throwOnError: false);
-            if (hostType == null)
+            if (_ruffleProxy == null)
             {
-                throw new InvalidOperationException("未找到 Ruffle WebView2 宿主类型。");
+                throw new InvalidOperationException("Ruffle 本地代理尚未初始化。");
             }
 
-            object instance = Activator.CreateInstance(hostType, pnlBrowserHost, _ruffleProxy);
-            if (!(instance is IRuffleBrowserHost host))
-            {
-                throw new InvalidOperationException("Ruffle WebView2 宿主初始化失败。");
-            }
-
+            IRuffleBrowserHost host = new RuffleWebViewHost(pnlBrowserHost, _ruffleProxy);
             return host;
         }
 
@@ -227,17 +289,8 @@ namespace WebBrowserApp
 
         private void InitializeCookieLibrary()
         {
-            string cookieDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cookies");
-            if (!Directory.Exists(cookieDirectory))
-            {
-                try
-                {
-                    Directory.CreateDirectory(cookieDirectory);
-                }
-                catch
-                {
-                }
-            }
+            _cookieProfileManager.EnsureInitialized();
+            string cookieDirectory = _cookieProfileManager.CookieDirectory;
 
             watcher = new FileSystemWatcher(cookieDirectory)
             {
@@ -257,56 +310,264 @@ namespace WebBrowserApp
         {
             this.InvokeIfRequired(() =>
             {
-                string cookieDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "cookies");
                 _cookieFiles.Clear();
-
-                if (Directory.Exists(cookieDirectory))
+                _cookieFiles.AddRange(_cookieProfileManager.LoadProfileFiles());
+                _cookieDisplayEntries.Clear();
+                foreach (CookieDisplayEntry entry in BuildCookieDisplayEntries(_cookieFiles))
                 {
-                    _cookieFiles.AddRange(Directory.GetFiles(cookieDirectory, "*.xml").OrderBy(Path.GetFileName));
+                    _cookieDisplayEntries.Add(entry);
                 }
 
                 if (_cookieSelectionForm != null && !_cookieSelectionForm.IsDisposed)
                 {
-                    _cookieSelectionForm.SetCookieFiles(_cookieFiles);
+                    _cookieSelectionForm.SetCookieFiles(_cookieDisplayEntries);
                 }
             });
         }
 
-        public void ApplyCookiesAndRedirect(string cookieString, string domain, string redirectUrl)
+        private IEnumerable<CookieDisplayEntry> BuildCookieDisplayEntries(IEnumerable<string> files)
         {
-            if (string.IsNullOrWhiteSpace(cookieString) || string.IsNullOrWhiteSpace(domain))
+            var groups = new List<Tuple<string, CookieProfileManager.CookieProfile, string>>();
+            foreach (string file in files ?? Enumerable.Empty<string>())
+            {
+                CookieProfileManager.CookieProfile profile = _cookieProfileManager.LoadProfile(file);
+                string signature = profile == null
+                    ? "file:" + file
+                    : CookieProfileManager.BuildProfileSignature(profile);
+                groups.Add(Tuple.Create(file, profile, signature));
+            }
+
+            foreach (IGrouping<string, Tuple<string, CookieProfileManager.CookieProfile, string>> group in groups.GroupBy(item => item.Item3))
+            {
+                Tuple<string, CookieProfileManager.CookieProfile, string> first = group.First();
+                List<string> filePaths = group.Select(item => item.Item1).ToList();
+                string displayName = first.Item2?.UserName;
+                if (string.IsNullOrWhiteSpace(displayName))
+                {
+                    displayName = "未知用户";
+                }
+
+                yield return new CookieDisplayEntry(first.Item1, filePaths, displayName);
+            }
+        }
+
+        internal bool TryGetDroppedCookieXmlFiles(IDataObject dataObject, out string[] filePaths)
+        {
+            filePaths = Array.Empty<string>();
+            if (dataObject == null || !dataObject.GetDataPresent(DataFormats.FileDrop))
+            {
+                return false;
+            }
+
+            var droppedFiles = dataObject.GetData(DataFormats.FileDrop) as string[];
+            if (droppedFiles == null || droppedFiles.Length == 0)
+            {
+                return false;
+            }
+
+            filePaths = droppedFiles
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(path => path.Trim())
+                .Where(File.Exists)
+                .Where(path =>
+                {
+                    string extension = Path.GetExtension(path);
+                    return string.Equals(extension, ".xml", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase);
+                })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return filePaths.Length > 0;
+        }
+
+        internal void ImportCookieProfileFiles(IEnumerable<string> filePaths)
+        {
+            List<string> files = (filePaths ?? Enumerable.Empty<string>())
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (files.Count == 0)
             {
                 return;
             }
 
-            foreach (string cookie in cookieString.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            int importedCount = 0;
+            int groupedCount = 0;
+            var errors = new List<string>();
+            foreach (string filePath in files)
             {
-                string trimmed = cookie.Trim();
-                if (!trimmed.Contains("="))
+                string extension = Path.GetExtension(filePath) ?? string.Empty;
+                if (string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase))
                 {
+                    int importedFromZip = ImportCookieProfilesFromZip(filePath, errors);
+                    importedCount += importedFromZip;
+                    groupedCount += importedFromZip;
                     continue;
                 }
 
-                SetCurrentCookie(domain, trimmed);
+                CookieProfileManager.ImportResult result = _cookieProfileManager.ImportProfileFile(filePath);
+                if (result.Success)
+                {
+                    importedCount += 1;
+                    continue;
+                }
+
+                errors.Add(Path.GetFileName(filePath) + "： " + result.ErrorMessage);
             }
 
-            Uri uri = new Uri(domain);
+            LoadCookieFiles();
+
+            if (importedCount > 0)
+            {
+                UpdateStatus($"已导入 {importedCount} 个 Cookie XML");
+                ShowCookieImportToast(groupedCount > 0
+                    ? $"已从压缩包识别并保存 {groupedCount} 个 Cookie"
+                    : $"已导入 {importedCount} 个 Cookie");
+            }
+
+            if (errors.Count == 0)
+            {
+                return;
+            }
+
+            string message = importedCount > 0
+                ? "部分 Cookie XML 导入失败：\r\n\r\n" + string.Join("\r\n", errors)
+                : "未导入任何有效的 Cookie XML。\r\n\r\n" + string.Join("\r\n", errors);
+            MessageBox.Show(message, "Cookie 导入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private int ImportCookieProfilesFromZip(string zipPath, List<string> errors)
+        {
+            try
+            {
+                var zipFile = new FileInfo(zipPath);
+                if (!zipFile.Exists)
+                {
+                    errors.Add(Path.GetFileName(zipPath) + "：文件不存在");
+                    return 0;
+                }
+
+                if (zipFile.Length > 50L * 1024L * 1024L)
+                {
+                    errors.Add(Path.GetFileName(zipPath) + "：压缩包超过 50MB");
+                    return 0;
+                }
+
+                int imported = 0;
+                using (ZipArchive archive = ZipFile.OpenRead(zipPath))
+                {
+                    foreach (ZipArchiveEntry entry in archive.Entries)
+                    {
+                        if (entry == null || string.IsNullOrWhiteSpace(entry.Name))
+                        {
+                            continue;
+                        }
+
+                        if (!string.Equals(Path.GetExtension(entry.Name), ".xml", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        using (Stream stream = entry.Open())
+                        using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+                        {
+                            string rawText = reader.ReadToEnd();
+                            CookieProfileManager.ImportResult result =
+                                _cookieProfileManager.ImportProfileText(rawText, Path.GetFileNameWithoutExtension(entry.Name), preserveRawXml: true);
+                            if (result.Success)
+                            {
+                                imported += 1;
+                            }
+                            else
+                            {
+                                errors.Add(Path.GetFileName(zipPath) + " -> " + entry.Name + "： " + result.ErrorMessage);
+                            }
+                        }
+                    }
+                }
+
+                return imported;
+            }
+            catch (InvalidDataException)
+            {
+                errors.Add(Path.GetFileName(zipPath) + "：压缩包损坏或包含不支持的内容");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                errors.Add(Path.GetFileName(zipPath) + "： " + ex.Message);
+                return 0;
+            }
+        }
+
+        public void ApplyCookieProfileFile(string filePath)
+        {
+            CookieProfileManager.CookieProfile profile = _cookieProfileManager.LoadProfile(filePath);
+            if (profile == null)
+            {
+                MessageBox.Show("解析 Cookie 文件失败或文件内容无效。");
+                return;
+            }
+
+            ApplyCookieProfile(profile);
+        }
+
+        private void ApplyCookieProfile(CookieProfileManager.CookieProfile profile)
+        {
+            if (profile == null)
+            {
+                return;
+            }
+
+            string targetUrl = CookieProfileManager.BuildTargetUrl(profile);
+            if (string.IsNullOrWhiteSpace(targetUrl))
+            {
+                MessageBox.Show("Cookie 文件未能生成可访问的目标地址。");
+                return;
+            }
+
+            if (!Uri.TryCreate(profile.UserDomain, UriKind.Absolute, out Uri domainUri)
+                || !Uri.TryCreate(targetUrl, UriKind.Absolute, out Uri targetUri))
+            {
+                MessageBox.Show("Cookie 文件中的域名格式无效。");
+                return;
+            }
+
+            CookieProfileManager.CookieApplicationPlan applicationPlan =
+                CookieProfileManager.BuildCookieApplicationPlan(profile.UserCookies);
+            List<string> cookieEntries = applicationPlan == null
+                ? new List<string>()
+                : new List<string>(applicationPlan.CookieEntries);
+            if (cookieEntries.Count == 0)
+            {
+                MessageBox.Show("Cookie 文件里没有可应用的关键 Cookie。");
+                return;
+            }
+
+            ClearBrowserCookies();
+
             if (_browserMode == BrowserBackendMode.RuffleWebView2)
             {
-                ClearRuffleCookies();
-                ApplyRuffleCookies(uri, cookieString);
-                _ruffleProxy?.SetCookieHeader(uri, cookieString);
-                RuntimeDiagnostics.Write("cookie", $"apply via ruffle proxy domain={domain} redirect={redirectUrl}");
+                string combinedCookieHeader = applicationPlan.CookieHeader;
+                foreach (string cookieEntry in cookieEntries)
+                {
+                    ApplyRuffleCookies(domainUri, cookieEntry);
+                    ApplyRuffleCookies(targetUri, cookieEntry);
+                }
+
+                _ruffleProxy?.SetCookieHeader(domainUri, combinedCookieHeader);
+                _ruffleProxy?.SetCookieHeader(targetUri, combinedCookieHeader);
+                RuntimeDiagnostics.Write("cookie", $"apply via ruffle domain={profile.UserDomain} target={targetUrl} count={cookieEntries.Count} rule={applicationPlan.Rule}");
             }
             else
             {
-                _cookieManager.SetCookies(uri);
-                RuntimeDiagnostics.Write("cookie", $"apply via IE cookie store domain={domain} redirect={redirectUrl}");
+                _cookieManager.ApplyCookieEntries(domainUri, targetUri, cookieEntries);
+                RuntimeDiagnostics.Write("cookie", $"apply via IE domain={profile.UserDomain} target={targetUrl} count={cookieEntries.Count} rule={applicationPlan.Rule}");
             }
 
-            NavigateToAddress(redirectUrl);
-            txtUrl.Text = redirectUrl;
-            UpdateStatus($"已应用 Cookie 并跳转到 {redirectUrl}");
+            NavigateToAddress(targetUrl);
+            txtUrl.Text = targetUrl;
+            UpdateStatus($"已应用 Cookie 并跳转到 {targetUrl}");
         }
 
         public void SetCurrentCookie(string uri, string cookies)
@@ -364,6 +625,25 @@ namespace WebBrowserApp
             webBrowser.Navigate(target);
         }
 
+        internal void NavigateInPlace(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return;
+            }
+
+            this.InvokeIfRequired(() => NavigateToAddress(url));
+        }
+
+        internal void RememberPopupTarget(string url)
+        {
+            string normalized = ResolveIeRelativeUrl(url);
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                _lastPopupTargetUrl = normalized;
+            }
+        }
+
         private static Uri NormalizeUrl(string rawUrl)
         {
             if (string.IsNullOrWhiteSpace(rawUrl))
@@ -391,6 +671,378 @@ namespace WebBrowserApp
             txtUrl.Text = e.Url.ToString();
             _cookieManager.UpdateCurrentDomain(e.Url.ToString());
             UpdateStatus($"正在浏览 {e.Url.Host}");
+            RefreshZoneJumpAvailabilityAsync();
+        }
+
+        private void WebBrowser_Navigating(object sender, WebBrowserNavigatingEventArgs e)
+        {
+            if (_browserMode != BrowserBackendMode.NativeIe || e?.Url == null)
+            {
+                return;
+            }
+
+            string targetFrame = e.TargetFrameName ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(targetFrame)
+                || string.Equals(targetFrame, "_self", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(targetFrame, "_top", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (!IsHttpUrl(e.Url.AbsoluteUri))
+            {
+                return;
+            }
+
+            e.Cancel = true;
+            RememberPopupTarget(e.Url.AbsoluteUri);
+            RuntimeDiagnostics.Write("ie-nav", $"intercepted target-frame navigation frame={targetFrame} url={e.Url.AbsoluteUri}");
+            BeginInvoke((Action)(() => NavigateToAddress(e.Url.AbsoluteUri)));
+        }
+
+        private void WebBrowser_NewWindow(object sender, CancelEventArgs e)
+        {
+            if (_browserMode != BrowserBackendMode.NativeIe)
+            {
+                return;
+            }
+
+            e.Cancel = true;
+            string targetUrl = ResolveCurrentIePopupTarget();
+            if (string.IsNullOrWhiteSpace(targetUrl))
+            {
+                RuntimeDiagnostics.Write("ie-nav", "intercepted new window but target url was empty");
+                return;
+            }
+
+            RuntimeDiagnostics.Write("ie-nav", $"intercepted new window url={targetUrl}");
+            BeginInvoke((Action)(() => NavigateToAddress(targetUrl)));
+        }
+
+        private void WebBrowser_DocumentCompleted(object sender, WebBrowserDocumentCompletedEventArgs e)
+        {
+            if (_browserMode != BrowserBackendMode.NativeIe)
+            {
+                return;
+            }
+
+            if (webBrowser.Url != null && e?.Url != null
+                && !string.Equals(webBrowser.Url.AbsoluteUri, e.Url.AbsoluteUri, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            ForceIeLinksToReuseCurrentWindow();
+            InjectIeNavigationOverrideScript();
+            RefreshZoneJumpAvailabilityAsync();
+            _ = RefreshZoneJumpAvailabilityDelayedAsync(1200);
+            _ = VerifyPendingZoneJumpAfterLoadAsync(600);
+        }
+
+        private string ResolveCurrentIePopupTarget()
+        {
+            if (!string.IsNullOrWhiteSpace(_lastPopupTargetUrl))
+            {
+                string rememberedUrl = _lastPopupTargetUrl;
+                _lastPopupTargetUrl = string.Empty;
+                return rememberedUrl;
+            }
+
+            try
+            {
+                HtmlElement activeElement = webBrowser.Document?.ActiveElement;
+                if (activeElement != null)
+                {
+                    string href = activeElement.GetAttribute("href");
+                    string action = activeElement.GetAttribute("action");
+                    string candidate = !string.IsNullOrWhiteSpace(href) ? href : action;
+                    string resolved = ResolveIeRelativeUrl(candidate);
+                    if (!string.IsNullOrWhiteSpace(resolved))
+                    {
+                        return resolved;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                string statusText = webBrowser.StatusText;
+                string resolved = ResolveIeRelativeUrl(statusText);
+                if (!string.IsNullOrWhiteSpace(resolved))
+                {
+                    return resolved;
+                }
+            }
+            catch
+            {
+            }
+
+            return string.Empty;
+        }
+
+        private string ResolveIeRelativeUrl(string candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return string.Empty;
+            }
+
+            candidate = candidate.Trim();
+            if (Uri.TryCreate(candidate, UriKind.Absolute, out Uri absoluteUri))
+            {
+                return absoluteUri.AbsoluteUri;
+            }
+
+            if (webBrowser.Url != null && Uri.TryCreate(webBrowser.Url, candidate, out Uri relativeUri))
+            {
+                return relativeUri.AbsoluteUri;
+            }
+
+            return string.Empty;
+        }
+
+        private void ForceIeLinksToReuseCurrentWindow()
+        {
+            HtmlDocument document = webBrowser.Document;
+            if (document == null)
+            {
+                return;
+            }
+
+            foreach (HtmlElement link in document.GetElementsByTagName("a"))
+            {
+                if (!string.IsNullOrWhiteSpace(link.GetAttribute("target")))
+                {
+                    link.SetAttribute("target", "_self");
+                }
+            }
+
+            foreach (HtmlElement form in document.GetElementsByTagName("form"))
+            {
+                if (!string.IsNullOrWhiteSpace(form.GetAttribute("target")))
+                {
+                    form.SetAttribute("target", "_self");
+                }
+            }
+        }
+
+        private void InjectIeNavigationOverrideScript()
+        {
+            HtmlDocument document = webBrowser.Document;
+            if (document?.Body == null)
+            {
+                return;
+            }
+
+            const string script =
+                "(function(){"
+                + "if(window.__pvzolNavHookInstalled){return;}"
+                + "window.__pvzolNavHookInstalled=true;"
+                + "function remember(url){try{if(url&&window.external&&typeof window.external.RememberPopupTarget!=='undefined'){window.external.RememberPopupTarget(String(url));}}catch(e){}}"
+                + "function nav(url){remember(url);try{if(url&&window.external&&typeof window.external.NavigateInPlace!=='undefined'){window.external.NavigateInPlace(String(url));return true;}}catch(e){}try{if(url){window.location.href=String(url);return true;}}catch(ex){}return false;}"
+                + "window.open=function(url){remember(url);nav(url);return window;};"
+                + "if(window.showModalDialog){window.showModalDialog=function(url){remember(url);nav(url);return null;};}"
+                + "if(window.showModelessDialog){window.showModelessDialog=function(url){remember(url);nav(url);return null;};}"
+                + "function patchTargets(){"
+                + "var anchors=document.getElementsByTagName('a');"
+                + "for(var i=0;i<anchors.length;i++){try{anchors[i].target='_self';anchors[i].onclick=function(evt){evt=evt||window.event;remember(this.href);nav(this.href);if(evt){evt.returnValue=false;if(evt.preventDefault){evt.preventDefault();}}return false;};anchors[i].onmousedown=function(){remember(this.href);};}catch(e){}}"
+                + "var forms=document.getElementsByTagName('form');"
+                + "for(var j=0;j<forms.length;j++){try{if(forms[j].target){forms[j].target='_self';}}catch(e){}}"
+                + "}"
+                + "patchTargets();"
+                + "if(window.setInterval){window.setInterval(patchTargets,800);}"
+                + "if(document.attachEvent){document.attachEvent('onclick',function(evt){evt=evt||window.event;var el=evt?evt.srcElement:null;while(el&&el.tagName&&el.tagName.toLowerCase()!='a'){el=el.parentNode;}if(el&&el.href){remember(el.href);nav(el.href);evt.returnValue=false;return false;}return true;});}"
+                + "})();";
+
+            try
+            {
+                document.InvokeScript("execScript", new object[] { script, "JavaScript" });
+            }
+            catch
+            {
+            }
+        }
+
+        private async Task RefreshZoneJumpAvailabilityDelayedAsync(int delayMilliseconds)
+        {
+            await Task.Delay(Math.Max(1, delayMilliseconds)).ConfigureAwait(true);
+            if (!IsDisposed)
+            {
+                RefreshZoneJumpAvailabilityAsync();
+            }
+        }
+
+        private void InitializeTopBarLayout()
+        {
+            pnlTopBar.Resize += (s, e) => LayoutTopBarControls();
+        }
+
+        private void LayoutTopBarControls()
+        {
+            if (pnlTopBar == null)
+            {
+                return;
+            }
+
+            int margin = 12;
+            int gap = 8;
+            int top = 10;
+            int buttonHeight = 34;
+            int x = margin;
+
+            btnZoneJump.SetBounds(x, top, 46, buttonHeight);
+            x += btnZoneJump.Width + gap;
+
+            btnRefresh.SetBounds(x, top, 72, buttonHeight);
+            x += btnRefresh.Width + gap;
+
+            btnHome.SetBounds(x, top, 72, buttonHeight);
+            x += btnHome.Width + gap;
+
+            int right = pnlTopBar.ClientSize.Width - margin;
+            btnSaveCookie.SetBounds(right - 170, top, 170, buttonHeight);
+            right = btnSaveCookie.Left - gap;
+
+            btnGo.SetBounds(right - 58, top, 58, buttonHeight);
+            right = btnGo.Left - gap;
+
+            int urlWidth = Math.Max(180, right - x);
+            txtUrl.SetBounds(x, top + 4, urlWidth, 26);
+        }
+
+        private void InitializeZoneJumpMonitor()
+        {
+            _zoneJumpMonitorTimer.Tick += ZoneJumpMonitorTimer_Tick;
+            _zoneJumpMonitorTimer.Start();
+        }
+
+        private void InitializeJumpSavePromptUi()
+        {
+            _zoneJumpSavePromptPanel = new Panel
+            {
+                BackColor = Color.FromArgb(255, 251, 235),
+                Height = 46,
+                Padding = new Padding(12, 8, 12, 8),
+                Visible = false
+            };
+            _zoneJumpSavePromptPanel.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+
+            _zoneJumpSavePromptLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                ForeColor = Color.FromArgb(120, 53, 15),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+
+            Button btnSave = CreatePromptActionButton("确认保存");
+            btnSave.Click += (s, e) => HandleZoneJumpSavePromptAction(saveAndApply: false, dismissOnly: false);
+            Button btnSaveApply = CreatePromptActionButton("保存并跳转");
+            btnSaveApply.Click += (s, e) => HandleZoneJumpSavePromptAction(saveAndApply: true, dismissOnly: false);
+            Button btnSkip = CreatePromptActionButton("不保存");
+            btnSkip.Click += (s, e) => HandleZoneJumpSavePromptAction(saveAndApply: false, dismissOnly: true);
+
+            var buttonPanel = new FlowLayoutPanel
+            {
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Dock = DockStyle.Right,
+                FlowDirection = FlowDirection.LeftToRight,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+                WrapContents = false
+            };
+            buttonPanel.Controls.Add(btnSave);
+            buttonPanel.Controls.Add(btnSaveApply);
+            buttonPanel.Controls.Add(btnSkip);
+
+            _zoneJumpSavePromptPanel.Controls.Add(_zoneJumpSavePromptLabel);
+            _zoneJumpSavePromptPanel.Controls.Add(buttonPanel);
+            pnlBrowserHost.Controls.Add(_zoneJumpSavePromptPanel);
+            PositionZoneJumpSavePrompt();
+            _zoneJumpSavePromptPanel.BringToFront();
+        }
+
+        private void PositionZoneJumpSavePrompt()
+        {
+            if (_zoneJumpSavePromptPanel == null || pnlBrowserHost == null)
+            {
+                return;
+            }
+
+            int width = Math.Max(0, pnlBrowserHost.ClientSize.Width);
+            int y = Math.Max(0, pnlBrowserHost.ClientSize.Height - _zoneJumpSavePromptPanel.Height);
+            _zoneJumpSavePromptPanel.Bounds = new Rectangle(0, y, width, _zoneJumpSavePromptPanel.Height);
+        }
+
+        private void InitializeCookieImportToastUi()
+        {
+            _cookieImportToastPanel = new Panel
+            {
+                BackColor = Color.FromArgb(30, 41, 59),
+                Size = new Size(320, 42),
+                Visible = false
+            };
+
+            _cookieImportToastLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                ForeColor = Color.White,
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+            _cookieImportToastPanel.Controls.Add(_cookieImportToastLabel);
+            Controls.Add(_cookieImportToastPanel);
+            PositionCookieImportToast();
+            _cookieImportToastPanel.BringToFront();
+        }
+
+        private static Button CreatePromptActionButton(string text)
+        {
+            return new Button
+            {
+                AutoSize = true,
+                BackColor = Color.White,
+                Cursor = Cursors.Hand,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Microsoft YaHei UI", 8.8F),
+                ForeColor = Color.FromArgb(55, 65, 81),
+                Margin = new Padding(0, 0, 8, 0),
+                Padding = new Padding(10, 3, 10, 3),
+                Text = text,
+                UseVisualStyleBackColor = false
+            };
+        }
+
+        private void ZoneJumpMonitorTimer_Tick(object sender, EventArgs e)
+        {
+            if (_zoneJumpRefreshInFlight)
+            {
+                return;
+            }
+
+            Uri currentUri = GetCurrentPageUri();
+            if (currentUri == null || !ShouldPollZoneJump(currentUri))
+            {
+                return;
+            }
+
+            RefreshZoneJumpAvailabilityAsync();
+        }
+
+        private static bool ShouldPollZoneJump(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                return false;
+            }
+
+            string url = currentUri.AbsoluteUri ?? string.Empty;
+            return url.IndexOf("pvz", StringComparison.OrdinalIgnoreCase) >= 0
+                || url.IndexOf("youkia", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private void RuffleHost_SourceChanged(object sender, RuffleSourceChangedEventArgs e)
@@ -417,6 +1069,119 @@ namespace WebBrowserApp
                 "ruffle-nav",
                 $"success={e.IsSuccess} status={e.WebErrorStatus} source={e.Source} display={displayUri}");
             UpdateStatus(e.IsSuccess ? $"正在浏览 {displayUri.Host}" : $"Ruffle 页面加载失败: {e.WebErrorStatus}");
+            RefreshZoneJumpAvailabilityAsync();
+            _ = RefreshZoneJumpAvailabilityDelayedAsync(1200);
+            _ = VerifyPendingZoneJumpAfterLoadAsync(600);
+        }
+
+        private void RuffleHost_NewWindowRequested(object sender, RuffleNewWindowRequestedEventArgs e)
+        {
+            if (e?.TargetUri == null)
+            {
+                return;
+            }
+
+            BeginInvoke((Action)(() => NavigateToAddress(e.TargetUri.AbsoluteUri)));
+        }
+
+        private async Task VerifyPendingZoneJumpAfterLoadAsync(int delayMilliseconds)
+        {
+            string pendingTarget = _pendingZoneJumpTargetUrl;
+            if (string.IsNullOrWhiteSpace(pendingTarget))
+            {
+                return;
+            }
+
+            if (delayMilliseconds > 0)
+            {
+                await Task.Delay(delayMilliseconds).ConfigureAwait(true);
+            }
+
+            if (IsDisposed || string.IsNullOrWhiteSpace(_pendingZoneJumpTargetUrl))
+            {
+                return;
+            }
+
+            bool hasSwf = await CurrentPageHasSwfAsync().ConfigureAwait(true);
+            if (hasSwf)
+            {
+                _pendingZoneJumpRetryAvailable = false;
+                _pendingZoneJumpTargetUrl = string.Empty;
+                return;
+            }
+
+            if (_pendingZoneJumpRetryAvailable && !_pendingZoneJumpRetryConsumed)
+            {
+                _pendingZoneJumpRetryConsumed = true;
+                UpdateStatus("当前页面未检测到 SWF，已自动重试一次跳转");
+                NavigateToAddress(pendingTarget);
+                return;
+            }
+
+            _pendingZoneJumpTargetUrl = string.Empty;
+        }
+
+        private async Task<bool> CurrentPageHasSwfAsync()
+        {
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    return false;
+                }
+
+                string script = @"
+(function(){
+    function hasSwfUrl(value){
+        return typeof value==='string' && /\.swf(\?.*)?$/i.test(value);
+    }
+    if(document.querySelector('ruffle-player,.pvzol-ruffle-host')){ return true; }
+    var nodes=document.querySelectorAll('embed,object,param[name=""movie""],param[name=""src""]');
+    for(var i=0;i<nodes.length;i++){
+        var node=nodes[i];
+        if(hasSwfUrl(node.getAttribute&&node.getAttribute('src'))){ return true; }
+        if(hasSwfUrl(node.getAttribute&&node.getAttribute('data'))){ return true; }
+        if(hasSwfUrl(node.getAttribute&&node.getAttribute('value'))){ return true; }
+        if(node.getAttribute&&node.getAttribute('data-pvzol-flash-url')){ return true; }
+    }
+    return false;
+})();";
+                string result = await _ruffleHost.ExecuteScriptAsync(script).ConfigureAwait(true);
+                return string.Equals(DecodeWebView2String(result), "true", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals((result ?? string.Empty).Trim(), "true", StringComparison.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                HtmlDocument doc = webBrowser.Document;
+                if (doc == null)
+                {
+                    return false;
+                }
+
+                foreach (HtmlElement element in doc.GetElementsByTagName("embed"))
+                {
+                    string src = element.GetAttribute("src");
+                    if (!string.IsNullOrWhiteSpace(src) && src.IndexOf(".swf", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return true;
+                    }
+                }
+
+                foreach (HtmlElement element in doc.GetElementsByTagName("object"))
+                {
+                    string data = element.GetAttribute("data");
+                    if (!string.IsNullOrWhiteSpace(data) && data.IndexOf(".swf", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
         }
 
         private void ClearRuffleCookies()
@@ -469,6 +1234,305 @@ namespace WebBrowserApp
 
             webBrowser.Refresh(WebBrowserRefreshOption.Completely);
             UpdateStatus("已刷新当前页面");
+        }
+
+        private void BtnZoneJump_Click(object sender, EventArgs e)
+        {
+            if (!_zoneJumpAvailable)
+            {
+                UpdateStatus("当前页面尚不满足区服跳转条件");
+                return;
+            }
+
+            _zoneJumpPanelManuallyHidden = _serverJumpForm != null && !_serverJumpForm.IsDisposed && _serverJumpForm.Visible;
+            ShowZoneJumpPanel(!_zoneJumpPanelManuallyHidden);
+        }
+
+        private async void BtnSaveCookie_Click(object sender, EventArgs e)
+        {
+            Uri currentUri = GetCurrentPageUri();
+            if (currentUri == null)
+            {
+                UpdateStatus("当前没有可保存 Cookie 的页面");
+                return;
+            }
+
+            CookieProfileManager.SaveCookieMatch match = await FindSavableCookieMatchAsync(currentUri).ConfigureAwait(true);
+            if (match == null)
+            {
+                UpdateStatus("当前页面没有可保存的 Cookie");
+                return;
+            }
+
+            FileInfo savedFile = _cookieProfileManager.SaveProfileFromPage(
+                match.SourceUri,
+                match.PersistedCookies,
+                GetCurrentPageTitleHint(currentUri));
+            if (savedFile == null)
+            {
+                RuntimeDiagnostics.Write("cookie-save", $"failed page={currentUri} source={match.SourceUri} rule={match.Rule}");
+                UpdateStatus("保存 Cookie 失败");
+                return;
+            }
+
+            LoadCookieFiles();
+            RuntimeDiagnostics.Write(
+                "cookie-save",
+                $"saved page={currentUri} source={match.SourceUri} domain={match.UserDomain} rule={match.Rule} file={savedFile.FullName}");
+            UpdateStatus($"已保存 Cookie：{savedFile.Name}");
+        }
+
+        private void InitializeZoneJumpUi()
+        {
+            EnsureZoneJumpPanelCreated();
+            btnZoneJump.Enabled = false;
+        }
+
+        private void EnsureZoneJumpPanelCreated()
+        {
+            if (_serverJumpPanel != null && !_serverJumpPanel.IsDisposed)
+            {
+                return;
+            }
+
+            _serverJumpPanel = new ServerJumpPanel(HandleZoneJumpRequest, HandleZoneFavoriteToggle, HandleZoneJumpPanelClosed)
+            {
+                Width = 216
+            };
+            _serverJumpPanel.SetOrderFilePath(_zoneOrderManager.FilePath);
+        }
+
+        private void EnsureZoneJumpPopupCreated()
+        {
+            EnsureZoneJumpPanelCreated();
+            if (_serverJumpForm != null && !_serverJumpForm.IsDisposed)
+            {
+                return;
+            }
+
+            _serverJumpForm = new Form
+            {
+                AutoScaleMode = AutoScaleMode.Font,
+                BackColor = Color.White,
+                ClientSize = new Size(216, 420),
+                FormBorderStyle = FormBorderStyle.SizableToolWindow,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                MinimumSize = new Size(216, 340),
+                ShowIcon = false,
+                ShowInTaskbar = false,
+                StartPosition = FormStartPosition.Manual,
+                Text = "区服跳转"
+            };
+            _serverJumpPanel.Dock = DockStyle.Fill;
+            _serverJumpForm.Controls.Add(_serverJumpPanel);
+            _serverJumpForm.FormClosed += ServerJumpForm_FormClosed;
+        }
+
+        private void HandleZoneJumpPanelClosed()
+        {
+            _zoneJumpPanelManuallyHidden = true;
+            ShowZoneJumpPanel(false);
+        }
+
+        private void ShowZoneJumpPanel(bool visible)
+        {
+            if (_serverJumpPanel == null)
+            {
+                return;
+            }
+
+            EnsureZoneJumpPopupCreated();
+            if (_serverJumpForm == null)
+            {
+                return;
+            }
+
+            _serverJumpPanel.Visible = visible;
+
+            if (visible)
+            {
+                UpdateZoneJumpPopupPlacement();
+                if (!_serverJumpForm.Visible)
+                {
+                    _serverJumpForm.Show(this);
+                }
+                else
+                {
+                    _serverJumpForm.BringToFront();
+                }
+                return;
+            }
+
+            if (_serverJumpForm.Visible)
+            {
+                _serverJumpForm.Hide();
+            }
+        }
+
+        private async void HandleZoneJumpRequest(int zone)
+        {
+            if (zone <= 0)
+            {
+                return;
+            }
+
+            string targetUrl = $"http://www.youkia.com/index.php/pvz/s{zone}";
+            Uri currentUri = GetCurrentPageUri();
+            string cookieHeader = await GetCurrentCookieHeaderAsync(currentUri).ConfigureAwait(true);
+            if (!string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                ApplyCookieHeaderToTarget(targetUrl, cookieHeader);
+            }
+
+            _zoneJumpPanelManuallyHidden = true;
+            ShowZoneJumpPanel(false);
+            _pendingZoneJumpTargetUrl = targetUrl;
+            _pendingZoneJumpRetryAvailable = true;
+            _pendingZoneJumpRetryConsumed = false;
+            HideZoneJumpSavePrompt();
+            _pendingZoneJumpSaveMatch = null;
+            _zoneJumpSavePollTimer.Stop();
+            _zoneJumpSavePollTimer.Start();
+            NavigateToAddress(targetUrl);
+            UpdateStatus($"正在跳转到 {zone} 区");
+        }
+
+        private void HandleZoneFavoriteToggle(int zone)
+        {
+            _zoneOrderManager.ToggleFavorite(zone);
+            RefreshZoneJumpPanelItems();
+        }
+
+        private void ApplyCookieHeaderToTarget(string targetUrl, string cookieHeader)
+        {
+            if (string.IsNullOrWhiteSpace(targetUrl)
+                || string.IsNullOrWhiteSpace(cookieHeader)
+                || !Uri.TryCreate("http://www.youkia.com", UriKind.Absolute, out Uri rootUri)
+                || !Uri.TryCreate(targetUrl, UriKind.Absolute, out Uri targetUri))
+            {
+                return;
+            }
+
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                _ruffleHost?.ApplyCookies(rootUri, cookieHeader);
+                _ruffleHost?.ApplyCookies(targetUri, cookieHeader);
+                _ruffleProxy?.SetCookieHeader(rootUri, cookieHeader);
+                _ruffleProxy?.SetCookieHeader(targetUri, cookieHeader);
+                return;
+            }
+
+            _cookieManager.ApplyCookieEntries(rootUri, targetUri, SplitCookieHeaderEntries(cookieHeader));
+        }
+
+        private static IEnumerable<string> SplitCookieHeaderEntries(string cookieHeader)
+        {
+            return (cookieHeader ?? string.Empty)
+                .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => value.Trim())
+                .Where(value => value.Contains("="));
+        }
+
+        private void RefreshZoneJumpPanelItems()
+        {
+            IReadOnlyList<int> zones = _zoneOrderManager.BuildDisplayOrder();
+            HashSet<int> favorites = _zoneOrderManager.LoadFavoriteZones();
+            string orderSignature = string.Join(",", zones) + "|fav:" + string.Join(",", favorites.OrderBy(value => value));
+            _zoneJumpOrderSignature = orderSignature;
+            _serverJumpPanel?.SetOrderFilePath(_zoneOrderManager.FilePath);
+            _serverJumpPanel?.SetZones(zones, favorites);
+        }
+
+        private async void RefreshZoneJumpAvailabilityAsync()
+        {
+            if (_zoneJumpRefreshInFlight)
+            {
+                return;
+            }
+
+            _zoneJumpRefreshInFlight = true;
+            int version = ++_zoneJumpRefreshVersion;
+            try
+            {
+                Uri currentUri = GetCurrentPageUri();
+                string cookieHeader = await GetCurrentCookieHeaderAsync(currentUri).ConfigureAwait(true);
+                if (IsDisposed || version != _zoneJumpRefreshVersion)
+                {
+                    return;
+                }
+
+                bool available = IsZoneJumpContextAvailable(currentUri, cookieHeader, out string availabilityKey);
+                bool popupVisible = _serverJumpForm != null && !_serverJumpForm.IsDisposed && _serverJumpForm.Visible;
+                if (!available)
+                {
+                    _zoneJumpAvailable = false;
+                    _zoneJumpAvailabilityKey = string.Empty;
+                    btnZoneJump.Enabled = popupVisible;
+                    if (!popupVisible)
+                    {
+                        ShowZoneJumpPanel(false);
+                    }
+                    return;
+                }
+
+                bool availabilityChanged = !string.Equals(_zoneJumpAvailabilityKey, availabilityKey, StringComparison.OrdinalIgnoreCase);
+                if (availabilityChanged)
+                {
+                    _zoneJumpPanelManuallyHidden = false;
+                }
+
+                _zoneJumpAvailable = true;
+                _zoneJumpAvailabilityKey = availabilityKey;
+                btnZoneJump.Enabled = true;
+                IReadOnlyList<int> zones = _zoneOrderManager.BuildDisplayOrder();
+                HashSet<int> favorites = _zoneOrderManager.LoadFavoriteZones();
+                string orderSignature = string.Join(",", zones) + "|fav:" + string.Join(",", favorites.OrderBy(value => value));
+                if (availabilityChanged || !string.Equals(_zoneJumpOrderSignature, orderSignature, StringComparison.Ordinal))
+                {
+                    RefreshZoneJumpPanelItems();
+                }
+
+                if (!_zoneJumpPanelManuallyHidden && !popupVisible)
+                {
+                    ShowZoneJumpPanel(true);
+                }
+            }
+            finally
+            {
+                _zoneJumpRefreshInFlight = false;
+            }
+        }
+
+        private static bool IsZoneJumpContextAvailable(Uri currentUri, string cookieHeader, out string availabilityKey)
+        {
+            availabilityKey = string.Empty;
+            if (currentUri == null || string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                return false;
+            }
+
+            string url = currentUri.AbsoluteUri ?? string.Empty;
+            if (url.IndexOf("pvz", StringComparison.OrdinalIgnoreCase) < 0
+                || url.IndexOf("youkia", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return false;
+            }
+
+            List<string> cookieKeys = SplitCookieHeaderEntries(cookieHeader)
+                .Select(entry => entry.Substring(0, entry.IndexOf('=')).Trim())
+                .Where(entry => !string.IsNullOrWhiteSpace(entry))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            bool hasPvz = cookieKeys.Any(key => string.Equals(key, "pvz", StringComparison.OrdinalIgnoreCase));
+            bool hasYoukia = cookieKeys.Any(key => string.Equals(key, "youkia", StringComparison.OrdinalIgnoreCase));
+            if (!hasPvz || !hasYoukia)
+            {
+                return false;
+            }
+
+            availabilityKey = currentUri.Host + "|" + string.Join(",", cookieKeys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
+            return true;
         }
 
         private void TxtUrl_KeyDown(object sender, KeyEventArgs e)
@@ -544,7 +1608,7 @@ namespace WebBrowserApp
 
             _cookieSelectionForm = new CookieSelectionForm(this);
             _cookieSelectionForm.FormClosed += CookieSelectionForm_FormClosed;
-            _cookieSelectionForm.SetCookieFiles(_cookieFiles);
+            _cookieSelectionForm.SetCookieFiles(_cookieDisplayEntries);
 
             ShowPopupForm(_cookieSelectionForm, btnCookieTool);
         }
@@ -564,8 +1628,21 @@ namespace WebBrowserApp
             }
         }
 
+        private void ServerJumpForm_FormClosed(object sender, FormClosedEventArgs e)
+        {
+            if (_serverJumpForm != null)
+            {
+                _serverJumpForm.FormClosed -= ServerJumpForm_FormClosed;
+                _serverJumpForm = null;
+            }
+            _serverJumpPanel = null;
+            _zoneJumpPanelManuallyHidden = true;
+        }
+
         private void Browser_FormClosing(object sender, FormClosingEventArgs e)
         {
+            _zoneJumpMonitorTimer?.Stop();
+            _zoneJumpSavePollTimer?.Stop();
             SaveCookiePopupPlacement(_cookieSelectionForm);
             if (watcher != null)
             {
@@ -599,6 +1676,7 @@ namespace WebBrowserApp
 
             CloseProxyPopup();
             CloseCookiePopup();
+            CloseZoneJumpPopup();
             BeginShutdownCleanup();
         }
 
@@ -630,6 +1708,15 @@ namespace WebBrowserApp
 
         private void CleanupNonUiResources()
         {
+            try
+            {
+                ClearBrowserCookies();
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("shutdown", $"clear browser cookies failed error={ex}");
+            }
+
             try
             {
                 StopNativeProxy();
@@ -665,6 +1752,15 @@ namespace WebBrowserApp
             catch (Exception ex)
             {
                 RuntimeDiagnostics.Write("shutdown", $"dispose ruffle proxy failed error={ex}");
+            }
+
+            try
+            {
+                _zoneJumpSavePollTimer?.Stop();
+                _cookieImportToastTimer?.Stop();
+            }
+            catch
+            {
             }
 
             try
@@ -727,6 +1823,29 @@ namespace WebBrowserApp
             return true;
         }
 
+        private void UpdateZoneJumpPopupPlacement()
+        {
+            if (_serverJumpForm == null || _serverJumpForm.IsDisposed)
+            {
+                return;
+            }
+
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            Control browserSurface = GetActiveBrowserSurface();
+            Point browserOrigin = browserSurface.PointToScreen(Point.Empty);
+            int desiredHeight = Math.Max(360, browserSurface.Height);
+            _serverJumpForm.Height = Math.Min(desiredHeight, workingArea.Height - 24);
+
+            int x = browserOrigin.X - _serverJumpForm.Width - 8;
+            if (x < workingArea.Left + 12)
+            {
+                x = workingArea.Left + 12;
+            }
+
+            int y = Math.Max(workingArea.Top + 12, browserOrigin.Y);
+            _serverJumpForm.Location = ClampPopupLocation(new Point(x, y), _serverJumpForm.Size);
+        }
+
         private Point ClampPopupLocation(Point location, Size popupSize)
         {
             Rectangle workingArea = Screen.FromPoint(location).WorkingArea;
@@ -787,6 +1906,14 @@ namespace WebBrowserApp
             if (_cookieSelectionForm != null && !_cookieSelectionForm.IsDisposed)
             {
                 _cookieSelectionForm.Close();
+            }
+        }
+
+        private void CloseZoneJumpPopup()
+        {
+            if (_serverJumpForm != null && !_serverJumpForm.IsDisposed)
+            {
+                _serverJumpForm.Close();
             }
         }
 
@@ -1002,6 +2129,524 @@ namespace WebBrowserApp
             return -1;
         }
 
+        private Uri GetCurrentPageUri()
+        {
+            if (_browserMode == BrowserBackendMode.NativeIe && webBrowser.Url != null)
+            {
+                return webBrowser.Url;
+            }
+
+            if (Uri.TryCreate(txtUrl.Text, UriKind.Absolute, out Uri currentUri))
+            {
+                return currentUri;
+            }
+
+            return null;
+        }
+
+        private string GetCurrentPageTitleHint(Uri currentUri)
+        {
+            string title = string.Empty;
+            if (_browserMode == BrowserBackendMode.NativeIe)
+            {
+                title = webBrowser.DocumentTitle ?? string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(title) && currentUri != null)
+            {
+                title = currentUri.Host ?? string.Empty;
+            }
+
+            return title;
+        }
+
+        private async Task<string> GetCurrentCookieHeaderAsync(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                return string.Empty;
+            }
+
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    return string.Empty;
+                }
+
+                try
+                {
+                    Uri[] candidateUris = BuildCookieProbeUris(currentUri).ToArray();
+                    string cookieManagerHeader = await _ruffleHost.GetCookieHeaderAsync(candidateUris).ConfigureAwait(true);
+                    string scriptResult = await _ruffleHost.ExecuteScriptAsync("document.cookie").ConfigureAwait(true);
+                    string documentCookie = DecodeWebView2String(scriptResult);
+                    string mergedCookie = MergeCookieHeaders(cookieManagerHeader, documentCookie);
+                    if (!string.IsNullOrWhiteSpace(mergedCookie))
+                    {
+                        return mergedCookie;
+                    }
+
+                    return string.Empty;
+                }
+                catch (Exception ex)
+                {
+                    RuntimeDiagnostics.Write("cookie-save", $"read ruffle cookie failed error={ex.Message}");
+                    return string.Empty;
+                }
+            }
+
+            try
+            {
+                string internetCookie = ReadInternetCookieHeaderFromCandidates(currentUri);
+                string documentCookie = webBrowser.Document?.Cookie ?? string.Empty;
+                string mergedCookie = MergeCookieHeaders(internetCookie, documentCookie);
+                if (!string.IsNullOrWhiteSpace(mergedCookie))
+                {
+                    return mergedCookie;
+                }
+
+                return string.Empty;
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("cookie-save", $"read ie cookie failed error={ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        private async Task<CookieProfileManager.SaveCookieMatch> FindSavableCookieMatchAsync(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                return null;
+            }
+
+            foreach (Uri candidateUri in BuildCookieProbeUris(currentUri))
+            {
+                string cookieHeader = await GetCookieHeaderForCandidateAsync(currentUri, candidateUri).ConfigureAwait(true);
+                CookieProfileManager.SaveCookieMatch match = CookieProfileManager.MatchSavableCookies(candidateUri, cookieHeader);
+                RuntimeDiagnostics.Write(
+                    "cookie-save",
+                    $"probe page={currentUri} candidate={candidateUri} cookieLength={(cookieHeader ?? string.Empty).Length} matched={(match != null)}");
+                if (match != null)
+                {
+                    return match;
+                }
+            }
+
+            return null;
+        }
+
+        private async Task<string> GetCookieHeaderForCandidateAsync(Uri currentUri, Uri candidateUri)
+        {
+            if (candidateUri == null)
+            {
+                return string.Empty;
+            }
+
+            if (_browserMode == BrowserBackendMode.RuffleWebView2)
+            {
+                if (_ruffleHost == null || !_ruffleHost.IsInitialized)
+                {
+                    return string.Empty;
+                }
+
+                try
+                {
+                    string cookieManagerHeader = await _ruffleHost.GetCookieHeaderAsync(candidateUri).ConfigureAwait(true);
+                    string proxyHeader = _ruffleProxy?.GetRememberedCookieHeader(candidateUri) ?? string.Empty;
+                    if (currentUri != null
+                        && string.Equals(currentUri.Host, candidateUri.Host, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string scriptResult = await _ruffleHost.ExecuteScriptAsync("document.cookie").ConfigureAwait(true);
+                        string documentCookie = DecodeWebView2String(scriptResult);
+                        return MergeCookieHeaders(cookieManagerHeader, proxyHeader, documentCookie);
+                    }
+
+                    return MergeCookieHeaders(cookieManagerHeader, proxyHeader);
+                }
+                catch (Exception ex)
+                {
+                    RuntimeDiagnostics.Write("cookie-save", $"read candidate ruffle cookie failed uri={candidateUri} error={ex.Message}");
+                    return string.Empty;
+                }
+            }
+
+            try
+            {
+                string internetCookie = ReadInternetCookieHeader(candidateUri);
+                if (currentUri != null
+                    && string.Equals(currentUri.Host, candidateUri.Host, StringComparison.OrdinalIgnoreCase))
+                {
+                    string documentCookie = webBrowser.Document?.Cookie ?? string.Empty;
+                    return MergeCookieHeaders(internetCookie, documentCookie);
+                }
+
+                return internetCookie ?? string.Empty;
+            }
+            catch (Exception ex)
+            {
+                RuntimeDiagnostics.Write("cookie-save", $"read candidate ie cookie failed uri={candidateUri} error={ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        private static string ReadInternetCookieHeaderFromCandidates(Uri currentUri)
+        {
+            return MergeCookieHeaders(BuildCookieProbeUris(currentUri).Select(ReadInternetCookieHeader));
+        }
+
+        private static IEnumerable<Uri> BuildCookieProbeUris(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                yield break;
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Uri candidate in EnumerateCookieProbeUris(currentUri))
+            {
+                if (candidate != null && seen.Add(candidate.AbsoluteUri))
+                {
+                    yield return candidate;
+                }
+            }
+        }
+
+        private static IEnumerable<Uri> EnumerateCookieProbeUris(Uri currentUri)
+        {
+            yield return currentUri;
+
+            string legacyRedirectTarget = CookieProfileManager.ResolveLegacyYoukiaRedirectTarget(currentUri);
+            if (!string.IsNullOrWhiteSpace(legacyRedirectTarget)
+                && Uri.TryCreate(legacyRedirectTarget, UriKind.Absolute, out Uri legacyTargetUri))
+            {
+                yield return legacyTargetUri;
+            }
+
+            string authority = currentUri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+            if (Uri.TryCreate(authority + "/", UriKind.Absolute, out Uri authorityRoot))
+            {
+                yield return authorityRoot;
+            }
+
+            if (Uri.TryCreate(authority + "/index.php", UriKind.Absolute, out Uri authorityIndex))
+            {
+                yield return authorityIndex;
+            }
+
+            if (Uri.TryCreate(authority + "/pvz/index.php/default/main", UriKind.Absolute, out Uri authorityMain))
+            {
+                yield return authorityMain;
+            }
+
+            if (ShouldProbeYoukiaCookieDomain(currentUri))
+            {
+                foreach (string candidate in new[]
+                {
+                    "http://youkia.com/",
+                    "http://youkia.com/index.php",
+                    "http://pvz.youkia.com/",
+                    "http://pvz.youkia.com/index.php",
+                    "http://pvz.youkia.com/pvz/index.php/default/main",
+                    "http://www.youkia.com/",
+                    "http://www.youkia.com/index.php",
+                    "http://www.youkia.com/pvz/index.php/default/main"
+                })
+                {
+                    if (Uri.TryCreate(candidate, UriKind.Absolute, out Uri parsed))
+                    {
+                        yield return parsed;
+                    }
+                }
+            }
+        }
+
+        private static bool ShouldProbeYoukiaCookieDomain(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                return false;
+            }
+
+            string host = currentUri.Host ?? string.Empty;
+            string url = currentUri.AbsoluteUri ?? string.Empty;
+            return host.EndsWith(".youkia.com", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(host, "youkia.com", StringComparison.OrdinalIgnoreCase)
+                || url.IndexOf("youkia", StringComparison.OrdinalIgnoreCase) >= 0
+                || url.IndexOf("pvz", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string ReadInternetCookieHeader(Uri currentUri)
+        {
+            if (currentUri == null)
+            {
+                return string.Empty;
+            }
+
+            int size = 8192;
+            var builder = new StringBuilder(size);
+            if (!InternetGetCookieEx(currentUri.AbsoluteUri, null, builder, ref size, InternetCookieHttpOnly, IntPtr.Zero))
+            {
+                if (size <= 0)
+                {
+                    return string.Empty;
+                }
+
+                builder = new StringBuilder(size);
+                if (!InternetGetCookieEx(currentUri.AbsoluteUri, null, builder, ref size, InternetCookieHttpOnly, IntPtr.Zero))
+                {
+                    return string.Empty;
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        private static string MergeCookieHeaders(params string[] cookieHeaders)
+        {
+            return MergeCookieHeaders((IEnumerable<string>)cookieHeaders);
+        }
+
+        private static string MergeCookieHeaders(IEnumerable<string> cookieHeaders)
+        {
+            var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string header in cookieHeaders ?? Enumerable.Empty<string>())
+            {
+                foreach (string entry in SplitCookieHeaderEntries(header))
+                {
+                    int equalsIndex = entry.IndexOf('=');
+                    if (equalsIndex <= 0)
+                    {
+                        continue;
+                    }
+
+                    string key = entry.Substring(0, equalsIndex).Trim();
+                    if (string.IsNullOrWhiteSpace(key))
+                    {
+                        continue;
+                    }
+
+                    merged[key] = entry.Trim();
+                }
+            }
+
+            return string.Join("; ", merged.Values);
+        }
+
+        private static bool IsHttpUrl(string url)
+        {
+            return !string.IsNullOrWhiteSpace(url)
+                && (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static string DecodeWebView2String(string scriptResult)
+        {
+            if (string.IsNullOrWhiteSpace(scriptResult) || string.Equals(scriptResult, "null", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Empty;
+            }
+
+            string normalized = scriptResult.Trim();
+            if (normalized.Length >= 2 && normalized[0] == '"' && normalized[normalized.Length - 1] == '"')
+            {
+                normalized = normalized.Substring(1, normalized.Length - 2);
+            }
+
+            return Regex.Unescape(normalized);
+        }
+
+        private void ClearBrowserCookies()
+        {
+            try
+            {
+                ClearRuffleCookies();
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                _cookieManager.ClearAllCookies();
+            }
+            catch
+            {
+            }
+        }
+
+        private void InitializeCookieImportDragDrop()
+        {
+            btnCookieTool.AllowDrop = true;
+            btnCookieTool.DragEnter += BtnCookieTool_DragEnter;
+            btnCookieTool.DragOver += BtnCookieTool_DragOver;
+            btnCookieTool.DragLeave += BtnCookieTool_DragLeave;
+            btnCookieTool.DragDrop += BtnCookieTool_DragDrop;
+        }
+
+        private void BtnCookieTool_DragEnter(object sender, DragEventArgs e)
+        {
+            UpdateCookieButtonDropState(e);
+        }
+
+        private void BtnCookieTool_DragOver(object sender, DragEventArgs e)
+        {
+            UpdateCookieButtonDropState(e);
+        }
+
+        private void BtnCookieTool_DragLeave(object sender, EventArgs e)
+        {
+            SetCookieToolDropVisual(false);
+            _cookieSelectionForm?.SetDropOverlayVisible(false);
+        }
+
+        private void BtnCookieTool_DragDrop(object sender, DragEventArgs e)
+        {
+            SetCookieToolDropVisual(false);
+            _cookieSelectionForm?.SetDropOverlayVisible(false);
+
+            if (!TryGetDroppedCookieXmlFiles(e.Data, out string[] filePaths))
+            {
+                return;
+            }
+
+            ImportCookieProfileFiles(filePaths);
+        }
+
+        private void UpdateCookieButtonDropState(DragEventArgs e)
+        {
+            bool canImport = TryGetDroppedCookieXmlFiles(e.Data, out _);
+            e.Effect = canImport ? DragDropEffects.Copy : DragDropEffects.None;
+            SetCookieToolDropVisual(canImport);
+            _cookieSelectionForm?.SetDropOverlayVisible(canImport);
+        }
+
+        private void SetCookieToolDropVisual(bool active)
+        {
+            btnCookieTool.BackColor = active ? Color.FromArgb(219, 234, 254) : _cookieToolDefaultBackColor;
+            btnCookieTool.FlatAppearance.BorderColor = active
+                ? Color.FromArgb(59, 130, 246)
+                : Color.FromArgb(229, 231, 235);
+        }
+
+        private async void ZoneJumpSavePollTimer_Tick(object sender, EventArgs e)
+        {
+            if (_zoneJumpSavePollInFlight)
+            {
+                return;
+            }
+
+            Uri currentUri = GetCurrentPageUri();
+            if (currentUri == null)
+            {
+                return;
+            }
+
+            _zoneJumpSavePollInFlight = true;
+            try
+            {
+                CookieProfileManager.SaveCookieMatch match = await FindSavableCookieMatchAsync(currentUri).ConfigureAwait(true);
+                if (match == null)
+                {
+                    return;
+                }
+
+                _pendingZoneJumpSaveMatch = match;
+                _zoneJumpSavePollTimer.Stop();
+                ShowZoneJumpSavePrompt(match);
+            }
+            finally
+            {
+                _zoneJumpSavePollInFlight = false;
+            }
+        }
+
+        private void CookieImportToastTimer_Tick(object sender, EventArgs e)
+        {
+            _cookieImportToastTimer.Stop();
+            if (_cookieImportToastPanel != null)
+            {
+                _cookieImportToastPanel.Visible = false;
+            }
+        }
+
+        private void ShowZoneJumpSavePrompt(CookieProfileManager.SaveCookieMatch match)
+        {
+            if (_zoneJumpSavePromptPanel == null || match == null)
+            {
+                return;
+            }
+
+            _zoneJumpSavePromptLabel.Text = "检测到可保存的 Cookie，是否现在保存？";
+            PositionZoneJumpSavePrompt();
+            _zoneJumpSavePromptPanel.Visible = true;
+            _zoneJumpSavePromptPanel.BringToFront();
+        }
+
+        private void HideZoneJumpSavePrompt()
+        {
+            if (_zoneJumpSavePromptPanel != null)
+            {
+                _zoneJumpSavePromptPanel.Visible = false;
+            }
+        }
+
+        private void HandleZoneJumpSavePromptAction(bool saveAndApply, bool dismissOnly)
+        {
+            CookieProfileManager.SaveCookieMatch match = _pendingZoneJumpSaveMatch;
+            _pendingZoneJumpSaveMatch = null;
+            HideZoneJumpSavePrompt();
+            if (dismissOnly || match == null)
+            {
+                return;
+            }
+
+            FileInfo savedFile = _cookieProfileManager.SaveProfileFromPage(
+                match.SourceUri,
+                match.PersistedCookies,
+                GetCurrentPageTitleHint(match.SourceUri));
+            if (savedFile == null)
+            {
+                UpdateStatus("保存 Cookie 失败");
+                return;
+            }
+
+            LoadCookieFiles();
+            UpdateStatus($"已保存 Cookie：{savedFile.Name}");
+            if (saveAndApply)
+            {
+                ApplyCookieProfileFile(savedFile.FullName);
+            }
+        }
+
+        private void ShowCookieImportToast(string message)
+        {
+            if (_cookieImportToastPanel == null || _cookieImportToastLabel == null)
+            {
+                return;
+            }
+
+            _cookieImportToastLabel.Text = message ?? string.Empty;
+            PositionCookieImportToast();
+            _cookieImportToastPanel.Visible = true;
+            _cookieImportToastPanel.BringToFront();
+            _cookieImportToastTimer.Stop();
+            _cookieImportToastTimer.Start();
+        }
+
+        private void PositionCookieImportToast()
+        {
+            if (_cookieImportToastPanel == null)
+            {
+                return;
+            }
+
+            int x = Math.Max(12, ClientSize.Width - _cookieImportToastPanel.Width - 24);
+            int y = Math.Max(72, ClientSize.Height - _cookieImportToastPanel.Height - 56);
+            _cookieImportToastPanel.Location = new Point(x, y);
+        }
+
         private void UpdateStatus(string message)
         {
             lblStatus.Text = $"[{DateTime.Now:HH:mm:ss}] {message}";
@@ -1031,37 +2676,37 @@ namespace WebBrowserApp
                 {
                     string script = @"
 (function(){
-    function request(node){
-        if(!node){return false;}
-        var methods=['requestFullscreen','webkitRequestFullscreen','mozRequestFullScreen','msRequestFullscreen'];
-        for(var i=0;i<methods.length;i++){
-            var fn=node[methods[i]];
-            if(typeof fn==='function'){
-                try{fn.call(node);return true;}catch(e){}
-            }
+    if(typeof window.__pvzolToggleEmbeddedFullscreen==='function'){
+        return window.__pvzolToggleEmbeddedFullscreen();
+    }
+    var node=document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+    if(!node){
+        return 'missing';
+    }
+    var methods=['enterFullscreen','requestFullscreen','webkitRequestFullscreen'];
+    for(var i=0;i<methods.length;i++){
+        var fn=node[methods[i]];
+        if(typeof fn==='function'){
+            try{fn.call(node);return 'enter';}catch(e){}
         }
-        return false;
     }
-    if(document.fullscreenElement||document.webkitFullscreenElement||document.msFullscreenElement){
-        if(document.exitFullscreen){document.exitFullscreen();return 'exit';}
-        if(document.webkitExitFullscreen){document.webkitExitFullscreen();return 'exit';}
-        if(document.msExitFullscreen){document.msExitFullscreen();return 'exit';}
+    if(typeof node.setFullscreen==='function'){
+        try{node.setFullscreen(true);return 'enter';}catch(e){}
     }
-    var node=document.querySelector('ruffle-player,ruffle-embed,ruffle-object,object,embed');
-    return request(node)?'ok':'missing';
+    return 'missing';
 })();";
                     string result = await _ruffleHost.ExecuteScriptAsync(script).ConfigureAwait(true);
-                    if ((result ?? string.Empty).Contains("ok"))
+                    if ((result ?? string.Empty).Contains("enter"))
                     {
-                        UpdateStatus("已尝试让页面内 Flash 进入全屏");
+                        UpdateStatus("已切换到浏览器窗口内的 Ruffle 全屏");
                     }
                     else if ((result ?? string.Empty).Contains("exit"))
                     {
-                        UpdateStatus("已尝试退出页面内全屏");
+                        UpdateStatus("已退出浏览器窗口内的 Ruffle 全屏");
                     }
                     else
                     {
-                        UpdateStatus("当前页面没有可全屏的 Ruffle/Flash 容器");
+                        UpdateStatus("当前页面没有可全屏的 Ruffle 容器");
                     }
                 }
                 catch (Exception ex)
@@ -1149,6 +2794,7 @@ namespace WebBrowserApp
                 {
                     CloseProxyPopup();
                     CloseCookiePopup();
+                    CloseZoneJumpPopup();
                     CleanupNonUiResources();
                 }
 
@@ -1165,13 +2811,41 @@ namespace WebBrowserApp
             base.Dispose(disposing);
         }
 
+        [ComVisible(true)]
+        public sealed class BrowserScriptBridge
+        {
+            private readonly Browser _browser;
+
+            public BrowserScriptBridge(Browser browser)
+            {
+                _browser = browser;
+            }
+
+            public void NavigateInPlace(string url)
+            {
+                _browser?.NavigateInPlace(url);
+            }
+
+            public void RememberPopupTarget(string url)
+            {
+                _browser?.RememberPopupTarget(url);
+            }
+        }
+
         private sealed class CookieManager
         {
             [DllImport("wininet.dll", CharSet = CharSet.Auto, SetLastError = true)]
             private static extern bool InternetSetCookie(string lpszUrlName, string lpszCookieName, string lpszCookieData);
 
+            [DllImport("wininet.dll", SetLastError = true)]
+            private static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int lpdwBufferLength);
+
+            private const int InternetOptionEndBrowserSession = 42;
+
             private Uri _currentDomain;
             private string _cookies = string.Empty;
+            private readonly HashSet<string> _appliedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            private readonly HashSet<string> _appliedCookieNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             public void UpdateCurrentDomain(string url)
             {
@@ -1197,6 +2871,73 @@ namespace WebBrowserApp
                 if (new Uri(domain).Host == _currentDomain?.Host)
                 {
                     _cookies = cookies;
+                }
+            }
+
+            public void ApplyCookieEntries(Uri domainUri, Uri targetUri, IEnumerable<string> cookieEntries)
+            {
+                List<string> entries = (cookieEntries ?? Enumerable.Empty<string>())
+                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                    .Select(value => value.Trim())
+                    .Where(value => value.Contains("="))
+                    .ToList();
+                if (entries.Count == 0)
+                {
+                    return;
+                }
+
+                ApplyCookieEntriesToUri(domainUri, entries);
+                ApplyCookieEntriesToUri(targetUri, entries);
+            }
+
+            public void ClearAllCookies()
+            {
+                InternetSetOption(IntPtr.Zero, InternetOptionEndBrowserSession, IntPtr.Zero, 0);
+
+                foreach (string url in _appliedUrls.ToList())
+                {
+                    foreach (string cookieName in _appliedCookieNames)
+                    {
+                        try
+                        {
+                            InternetSetCookie(url, cookieName, "deleted;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/");
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+
+                _appliedUrls.Clear();
+                _appliedCookieNames.Clear();
+                _cookies = string.Empty;
+            }
+
+            private void ApplyCookieEntriesToUri(Uri uri, IEnumerable<string> cookieEntries)
+            {
+                if (uri == null)
+                {
+                    return;
+                }
+
+                string absoluteUrl = uri.AbsoluteUri;
+                foreach (string cookieEntry in cookieEntries)
+                {
+                    int equalsIndex = cookieEntry.IndexOf('=');
+                    if (equalsIndex <= 0)
+                    {
+                        continue;
+                    }
+
+                    string cookieName = cookieEntry.Substring(0, equalsIndex).Trim();
+                    if (string.IsNullOrWhiteSpace(cookieName))
+                    {
+                        continue;
+                    }
+
+                    InternetSetCookie(absoluteUrl, null, cookieEntry + ";path=/");
+                    _appliedUrls.Add(absoluteUrl);
+                    _appliedCookieNames.Add(cookieName);
                 }
             }
         }
@@ -1334,11 +3075,28 @@ namespace WebBrowserApp
         }
     }
 
+    public sealed class CookieDisplayEntry
+    {
+        public CookieDisplayEntry(string filePath, IReadOnlyList<string> groupedFilePaths, string displayName)
+        {
+            FilePath = filePath;
+            GroupedFilePaths = groupedFilePaths ?? Array.Empty<string>();
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? "未知用户" : displayName;
+        }
+
+        public string FilePath { get; }
+
+        public IReadOnlyList<string> GroupedFilePaths { get; }
+
+        public string DisplayName { get; }
+    }
+
     public class CookieSelectionForm : Form
     {
         private readonly Browser _browser;
         private readonly FlowLayoutPanel _cookiePanel;
         private readonly Label _emptyLabel;
+        private readonly Panel _dropOverlay;
 
         public CookieSelectionForm(Browser browser)
         {
@@ -1356,6 +3114,7 @@ namespace WebBrowserApp
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
             Text = "Cookie 设置";
+            AllowDrop = true;
 
             var rootLayout = new TableLayoutPanel
             {
@@ -1419,7 +3178,7 @@ namespace WebBrowserApp
                 Dock = DockStyle.Fill,
                 Font = new Font("Microsoft YaHei UI", 8.5F),
                 ForeColor = Color.FromArgb(107, 114, 128),
-                Text = "自动读取程序同目录 cookies 文件夹内的 XML 文件",
+                Text = "自动读取 cookies 文件夹，可拖入 XML 或 50MB 内 ZIP 导入",
                 AutoSize = false,
                 TextAlign = ContentAlignment.TopLeft,
                 Margin = Padding.Empty
@@ -1435,21 +3194,40 @@ namespace WebBrowserApp
                 Text = "cookies 文件夹里还没有 XML 文件",
                 TextAlign = ContentAlignment.MiddleCenter
             };
+
+            _dropOverlay = new Panel
+            {
+                BackColor = Color.FromArgb(225, 239, 254),
+                Dock = DockStyle.Fill,
+                Visible = false
+            };
+            _dropOverlay.Controls.Add(new Label
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(30, 64, 175),
+                Text = "松开导入 Cookie XML / ZIP",
+                TextAlign = ContentAlignment.MiddleCenter
+            });
+            Controls.Add(_dropOverlay);
+            _dropOverlay.BringToFront();
+
+            EnableDropTarget(this);
         }
 
-        public void SetCookieFiles(IEnumerable<string> files)
+        public void SetCookieFiles(IEnumerable<CookieDisplayEntry> files)
         {
             _cookiePanel.SuspendLayout();
             _cookiePanel.Controls.Clear();
 
-            List<string> fileList = files?.ToList() ?? new List<string>();
+            List<CookieDisplayEntry> fileList = files?.ToList() ?? new List<CookieDisplayEntry>();
             if (fileList.Count == 0)
             {
                 _cookiePanel.Controls.Add(_emptyLabel);
             }
             else
             {
-                foreach (string file in fileList)
+                foreach (CookieDisplayEntry file in fileList)
                 {
                     _cookiePanel.Controls.Add(new CookieItem(file, _browser)
                     {
@@ -1460,6 +3238,70 @@ namespace WebBrowserApp
 
             _cookiePanel.ResumeLayout();
         }
+
+        internal void SetDropOverlayVisible(bool visible)
+        {
+            _dropOverlay.Visible = visible;
+            if (visible)
+            {
+                _dropOverlay.BringToFront();
+            }
+        }
+
+        private void EnableDropTarget(Control control)
+        {
+            if (control == null)
+            {
+                return;
+            }
+
+            control.AllowDrop = true;
+            control.DragEnter += DropTarget_DragEnter;
+            control.DragOver += DropTarget_DragOver;
+            control.DragLeave += DropTarget_DragLeave;
+            control.DragDrop += DropTarget_DragDrop;
+
+            foreach (Control child in control.Controls)
+            {
+                EnableDropTarget(child);
+            }
+        }
+
+        private void DropTarget_DragEnter(object sender, DragEventArgs e)
+        {
+            UpdateDropState(e);
+        }
+
+        private void DropTarget_DragOver(object sender, DragEventArgs e)
+        {
+            UpdateDropState(e);
+        }
+
+        private void DropTarget_DragLeave(object sender, EventArgs e)
+        {
+            if (!RectangleToScreen(ClientRectangle).Contains(Cursor.Position))
+            {
+                SetDropOverlayVisible(false);
+            }
+        }
+
+        private void DropTarget_DragDrop(object sender, DragEventArgs e)
+        {
+            SetDropOverlayVisible(false);
+            if (!_browser.TryGetDroppedCookieXmlFiles(e.Data, out string[] filePaths))
+            {
+                return;
+            }
+
+            _browser.ImportCookieProfileFiles(filePaths);
+        }
+
+        private void UpdateDropState(DragEventArgs e)
+        {
+            bool canImport = _browser.TryGetDroppedCookieXmlFiles(e.Data, out _);
+            e.Effect = canImport ? DragDropEffects.Copy : DragDropEffects.None;
+            SetDropOverlayVisible(canImport);
+        }
     }
 
     public class CookieItem : UserControl
@@ -1468,9 +3310,12 @@ namespace WebBrowserApp
 
         public string FilePath { get; }
 
-        public CookieItem(string filePath, Browser mainForm)
+        private readonly CookieDisplayEntry _entry;
+
+        public CookieItem(CookieDisplayEntry entry, Browser mainForm)
         {
-            FilePath = filePath;
+            _entry = entry;
+            FilePath = entry?.FilePath;
             _mainForm = mainForm;
             InitializeComponents();
         }
@@ -1487,7 +3332,7 @@ namespace WebBrowserApp
                 Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
                 ForeColor = Color.FromArgb(31, 41, 55),
                 Location = new Point(14, 14),
-                Text = ParseUserId()
+                Text = _entry?.DisplayName ?? ParseUserId()
             };
 
             var lblFileName = new Label
@@ -1496,7 +3341,9 @@ namespace WebBrowserApp
                 Font = new Font("Microsoft YaHei UI", 8.5F),
                 ForeColor = Color.FromArgb(107, 114, 128),
                 Location = new Point(14, 44),
-                Text = Path.GetFileName(FilePath)
+                Text = (_entry?.GroupedFilePaths?.Count ?? 0) > 1
+                    ? "相同 Cookie " + _entry.GroupedFilePaths.Count + " 份"
+                    : Path.GetFileName(FilePath)
             };
 
             var btnApply = new Button
@@ -1524,30 +3371,25 @@ namespace WebBrowserApp
 
         private string ParseUserId()
         {
-            try
+            CookieProfileManager.CookieProfile profile = new CookieProfileManager(AppDomain.CurrentDomain.BaseDirectory).LoadProfile(FilePath);
+            if (profile != null)
             {
-                var doc = XDocument.Load(FilePath);
-                return doc.Element("UserSetting")?.Element("UserID")?.Value ?? "未知用户";
+                if (!string.IsNullOrWhiteSpace(profile.UserName))
+                {
+                    return profile.UserName;
+                }
+
+                return "用户 " + profile.UserId;
             }
-            catch
-            {
-                return "未知用户";
-            }
+
+            return "未知用户";
         }
 
         private void ApplyCookie()
         {
             try
             {
-                var doc = XDocument.Load(FilePath);
-                string cookies = doc.Element("UserSetting")?.Element("UserCookies")?.Value;
-                string userDomain = doc.Element("UserSetting")?.Element("UserDomain")?.Value;
-
-                if (!string.IsNullOrEmpty(userDomain))
-                {
-                    string redirectUrl = $"{userDomain.TrimEnd('/')}/pvz/index.php/default/main";
-                    _mainForm.ApplyCookiesAndRedirect(cookies, userDomain, redirectUrl);
-                }
+                _mainForm.ApplyCookieProfileFile(FilePath);
             }
             catch (Exception ex)
             {

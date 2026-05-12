@@ -81,22 +81,27 @@
     <NativeArch Condition="'$(NativeArch)' == ''">x64</NativeArch>
     <WebView2RuntimeArch Condition="'$(NativeArch)' == 'x86'">win-x86</WebView2RuntimeArch>
     <WebView2RuntimeArch Condition="'$(NativeArch)' == 'x64'">win-x64</WebView2RuntimeArch>
+    <Log4NetReferencePath Condition="Exists('..\packages\log4net.1.2.10\lib\2.0\log4net.dll')">..\packages\log4net.1.2.10\lib\2.0\log4net.dll</Log4NetReferencePath>
+    <WebView2ReferenceRoot Condition="Exists('C:\Program Files\Microsoft OfficePLUS\3.16.0.46159\addin\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files\Microsoft OfficePLUS\3.16.0.46159\addin</WebView2ReferenceRoot>
+    <WebView2ReferenceRoot Condition="'$(WebView2ReferenceRoot)' == '' and Exists('C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\Microsoft.Web.WebView2.WinForms.dll')">C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit</WebView2ReferenceRoot>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="log4net, Version=1.2.10.0, Culture=neutral, PublicKeyToken=1b44e1d426115821, processorArchitecture=MSIL">
-      <HintPath>..\PVZOLBrowser\packages\log4net.1.2.10\lib\2.0\log4net.dll</HintPath>
+      <HintPath>$(Log4NetReferencePath)</HintPath>
     </Reference>
     <Reference Include="Microsoft.Web.WebView2.Core">
-      <HintPath>C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview\Microsoft.Web.WebView2.Core.dll</HintPath>
+      <HintPath>$(WebView2ReferenceRoot)\Microsoft.Web.WebView2.Core.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="Microsoft.Web.WebView2.WinForms">
-      <HintPath>C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview\Microsoft.Web.WebView2.WinForms.dll</HintPath>
+      <HintPath>$(WebView2ReferenceRoot)\Microsoft.Web.WebView2.WinForms.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Configuration" />
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
     <Reference Include="System.Xml.Linq" />
     <Reference Include="System.Data.DataSetExtensions" />
     <Reference Include="Microsoft.CSharp" />
@@ -117,6 +122,7 @@
     <Compile Include="Broswer.Designer.cs">
       <DependentUpon>Broswer.cs</DependentUpon>
     </Compile>
+    <Compile Include="CookieProfileManager.cs" />
     <Compile Include="FlashProxyNative.cs" />
     <Compile Include="FlashRuntimeDetector.cs" />
     <Compile Include="FlashRuntimeInfo.cs" />
@@ -132,6 +138,8 @@
     <Compile Include="RuffleLocalProxy.cs" />
     <Compile Include="RuffleWebViewHost.cs" />
     <Compile Include="RuntimeDiagnostics.cs" />
+    <Compile Include="ServerJumpPanel.cs" />
+    <Compile Include="ZoneOrderManager.cs" />
     <EmbeddedResource Include="Broswer.resx">
       <DependentUpon>Broswer.cs</DependentUpon>
     </EmbeddedResource>
@@ -162,6 +170,9 @@
     <None Include="App.config" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="assets\cookies\**\*.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="assets\ruffle\bootstrap.js">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -196,10 +207,10 @@
       SkipUnchangedFiles="true"
       Condition="!Exists('native\$(NativeArch)\Release\flash_proxy_core.dll') and Exists('..\NativeFlashProxy\build-win-$(NativeArch)\Release\flash_proxy_core.dll')" />
     <Copy
-      SourceFiles="C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview\runtimes\$(WebView2RuntimeArch)\native\WebView2Loader.dll"
+      SourceFiles="$(WebView2ReferenceRoot)\runtimes\$(WebView2RuntimeArch)\native\WebView2Loader.dll"
       DestinationFiles="$(OutputPath)WebView2Loader.dll"
       SkipUnchangedFiles="true"
-      Condition="Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\Extensions\Microsoft\Web Live Preview\runtimes\$(WebView2RuntimeArch)\native\WebView2Loader.dll')" />
+      Condition="Exists('$(WebView2ReferenceRoot)\runtimes\$(WebView2RuntimeArch)\native\WebView2Loader.dll')" />
     <Delete Files="$(OutputPath)log4net.xml;$(OutputPath)browser_runtime.log;$(OutputPath)ruffle_logs.txt" />
     <RemoveDir Directories="$(OutputPath)PVZOL浏览器.exe.WebView2;$(OutputPath)amf_dumps" />
   </Target>

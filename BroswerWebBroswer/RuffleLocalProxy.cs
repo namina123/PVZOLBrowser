@@ -178,6 +178,11 @@ namespace WebBrowserApp
             RuntimeDiagnostics.Write("ruffle-cookie", "cleared proxy cookie headers");
         }
 
+        internal string GetRememberedCookieHeader(Uri targetUri)
+        {
+            return FindCookieHeader(targetUri);
+        }
+
         internal void ConfigureLocalMapping(string cacheRootPath, IEnumerable<string> mappingHosts, IEnumerable<string> mappingUrlKeywords)
         {
             lock (_stateLock)
@@ -248,7 +253,30 @@ namespace WebBrowserApp
         internal bool TryGetOriginalUri(Uri managedUri, out Uri originalUri)
         {
             originalUri = null;
-            if (managedUri == null || BaseUri == null)
+            if (managedUri == null)
+            {
+                return false;
+            }
+
+            string path = managedUri.AbsolutePath ?? "/";
+            if (path.StartsWith(PlayerPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                string encoded = ParseQuery(managedUri.Query).TryGetValue("url", out string value) ? value : string.Empty;
+                if (Uri.TryCreate(encoded, UriKind.Absolute, out Uri playerUri))
+                {
+                    originalUri = playerUri;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (TryDecodeProxyTargetUri(managedUri, out originalUri))
+            {
+                return true;
+            }
+
+            if (BaseUri == null)
             {
                 return false;
             }
@@ -263,57 +291,7 @@ namespace WebBrowserApp
                 return false;
             }
 
-            string path = managedUri.AbsolutePath;
-            if (path.StartsWith(PlayerPrefix, StringComparison.OrdinalIgnoreCase))
-            {
-                string encoded = ParseQuery(managedUri.Query).TryGetValue("url", out string value) ? value : string.Empty;
-                if (Uri.TryCreate(encoded, UriKind.Absolute, out Uri playerUri))
-                {
-                    originalUri = playerUri;
-                    return true;
-                }
-
-                return false;
-            }
-
-            if (!path.StartsWith(ProxyPrefix, StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            string remainder = path.Substring(ProxyPrefix.Length);
-            int slashIndex = remainder.IndexOf('/');
-            if (slashIndex <= 0)
-            {
-                return false;
-            }
-
-            string scheme = remainder.Substring(0, slashIndex);
-            string authorityAndPath = remainder.Substring(slashIndex + 1);
-            int nextSlashIndex = authorityAndPath.IndexOf('/');
-            string authority = nextSlashIndex >= 0 ? authorityAndPath.Substring(0, nextSlashIndex) : authorityAndPath;
-            string absolutePath = nextSlashIndex >= 0 ? authorityAndPath.Substring(nextSlashIndex) : "/";
-
-            var builder = new UriBuilder
-            {
-                Scheme = scheme,
-                Host = authority
-            };
-
-            if (authority.Contains(":"))
-            {
-                int portSeparator = authority.LastIndexOf(':');
-                if (portSeparator > 0 && int.TryParse(authority.Substring(portSeparator + 1), out int explicitPort))
-                {
-                    builder.Host = authority.Substring(0, portSeparator);
-                    builder.Port = explicitPort;
-                }
-            }
-
-            builder.Path = absolutePath;
-            builder.Query = managedUri.Query.TrimStart('?');
-            originalUri = builder.Uri;
-            return true;
+            return TryDecodeProxyTargetUri(managedUri, out originalUri);
         }
 
         internal Uri GetDisplayUri(Uri currentUri)
@@ -356,7 +334,7 @@ namespace WebBrowserApp
                     return CreateTextResponse(400, "Bad Request", "Invalid target");
                 }
 
-                if (TryBuildWrappedGameMainResponse(proxyTarget, out RuffleResolvedResponse wrappedProxyResponse))
+                if (TryBuildWrappedGameMainResponse(proxyTarget, requestHeaders, out RuffleResolvedResponse wrappedProxyResponse))
                 {
                     return wrappedProxyResponse;
                 }
@@ -381,7 +359,7 @@ namespace WebBrowserApp
                 return null;
             }
 
-            if (TryBuildWrappedGameMainResponse(requestUri, out RuffleResolvedResponse wrappedResponse))
+            if (TryBuildWrappedGameMainResponse(requestUri, requestHeaders, out RuffleResolvedResponse wrappedResponse))
             {
                 return wrappedResponse;
             }
@@ -475,16 +453,79 @@ namespace WebBrowserApp
                 contentType = headerContentType ?? string.Empty;
             }
 
+            bool isKnownAmfEndpoint = requestUri != null
+                && (requestUri.AbsolutePath ?? string.Empty).IndexOf("/pvz/amf/", StringComparison.OrdinalIgnoreCase) >= 0;
             bool looksLikeAmf = contentType.IndexOf("application/x-amf", StringComparison.OrdinalIgnoreCase) >= 0
-                || TryParseAmfPacketInfo(requestBody) != null;
+                || TryParseAmfPacketInfo(requestBody) != null
+                || isKnownAmfEndpoint;
             if (looksLikeAmf)
             {
                 RuntimeDiagnostics.Write(
                     "ruffle-amf",
                     $"direct intercept method={httpMethod} url={requestUri} type={contentType} bodyBytes={(requestBody == null ? 0 : requestBody.Length)}");
+                if (requestBody == null || requestBody.Length == 0)
+                {
+                    RuntimeDiagnostics.Write(
+                        "ruffle-amf",
+                        $"skip direct intercept for empty-body amf url={requestUri}");
+                    return false;
+                }
             }
 
             return looksLikeAmf;
+        }
+
+        private static bool TryDecodeProxyTargetUri(Uri managedUri, out Uri originalUri)
+        {
+            originalUri = null;
+            if (managedUri == null)
+            {
+                return false;
+            }
+
+            string path = managedUri.AbsolutePath ?? string.Empty;
+            if (!path.StartsWith(ProxyPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string remainder = path.Substring(ProxyPrefix.Length);
+            int slashIndex = remainder.IndexOf('/');
+            if (slashIndex <= 0)
+            {
+                return false;
+            }
+
+            string scheme = remainder.Substring(0, slashIndex);
+            string authorityAndPath = remainder.Substring(slashIndex + 1);
+            int nextSlashIndex = authorityAndPath.IndexOf('/');
+            string authority = nextSlashIndex >= 0 ? authorityAndPath.Substring(0, nextSlashIndex) : authorityAndPath;
+            string absolutePath = nextSlashIndex >= 0 ? authorityAndPath.Substring(nextSlashIndex) : "/";
+            if (string.IsNullOrWhiteSpace(scheme) || string.IsNullOrWhiteSpace(authority))
+            {
+                return false;
+            }
+
+            var builder = new UriBuilder
+            {
+                Scheme = scheme,
+                Host = authority
+            };
+
+            if (authority.Contains(":"))
+            {
+                int portSeparator = authority.LastIndexOf(':');
+                if (portSeparator > 0 && int.TryParse(authority.Substring(portSeparator + 1), out int explicitPort))
+                {
+                    builder.Host = authority.Substring(0, portSeparator);
+                    builder.Port = explicitPort;
+                }
+            }
+
+            builder.Path = absolutePath;
+            builder.Query = managedUri.Query.TrimStart('?');
+            originalUri = builder.Uri;
+            return true;
         }
 
         private static RuffleResolvedResponse CreateTextResponse(int statusCode, string reasonPhrase, string body)
@@ -608,14 +649,19 @@ namespace WebBrowserApp
             {
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(originalUri);
                 request.Method = string.IsNullOrWhiteSpace(httpMethod) ? "GET" : httpMethod;
-                request.AllowAutoRedirect = true;
+                request.AllowAutoRedirect = false;
                 request.AutomaticDecompression = DecompressionMethods.None;
                 request.UserAgent = IeUserAgent;
                 request.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
                 request.Timeout = 15000;
                 request.ReadWriteTimeout = 15000;
                 request.Proxy = BuildUpstreamProxy(originalUri);
-                ApplyConfiguredCookies(request, originalUri);
+                ApplyConfiguredCookies(
+                    request,
+                    originalUri,
+                    requestHeaders != null && requestHeaders.TryGetValue("Cookie", out string runtimeCookieHeader)
+                        ? runtimeCookieHeader
+                        : string.Empty);
 
                 foreach (KeyValuePair<string, string> header in requestHeaders ?? new Dictionary<string, string>())
                 {
@@ -668,6 +714,7 @@ namespace WebBrowserApp
 
                 using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
                 {
+                    CaptureResponseCookies(originalUri, response.Headers);
                     return await BuildUpstreamResponseAsync(response, originalUri, addCorsHeaders, looksLikeAmf, amfInfo == null ? null : amfInfo.Target).ConfigureAwait(false);
                 }
             }
@@ -678,6 +725,7 @@ namespace WebBrowserApp
                 {
                     using (failedResponse)
                     {
+                        CaptureResponseCookies(originalUri, failedResponse.Headers);
                         return await BuildUpstreamResponseAsync(failedResponse, originalUri, addCorsHeaders, false, null).ConfigureAwait(false);
                     }
                 }
@@ -706,14 +754,20 @@ namespace WebBrowserApp
 
             string contentType = response.ContentType ?? "application/octet-stream";
             bool looksLikeAmf = forceAmfLogging || contentType.IndexOf("application/x-amf", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isRedirect = IsRedirectStatusCode(response.StatusCode);
+            string redirectTarget = GetRedirectTarget(response, originalUri);
             RuntimeDiagnostics.Write(
                 looksLikeAmf ? "ruffle-amf" : "ruffle-upstream",
                 $"response status={(int)response.StatusCode} type={contentType} bytes={body.Length} target={originalUri} amfTarget={(amfTarget ?? string.Empty)}");
+            if (isRedirect)
+            {
+                RuntimeDiagnostics.Write("ruffle-redirect", $"status={(int)response.StatusCode} source={originalUri} target={redirectTarget}");
+            }
             if (looksLikeAmf)
             {
                 WriteAmfDump("response", response.StatusCode.ToString(), originalUri, contentType, body, string.IsNullOrWhiteSpace(amfTarget) ? response.StatusDescription : amfTarget);
             }
-            if (IsHtmlContentType(contentType) && ShouldInjectBootstrapForHtml(originalUri, body))
+            if (!isRedirect && IsHtmlContentType(contentType) && ShouldInjectBootstrapForHtml(originalUri, body))
             {
                 RuntimeDiagnostics.Write("ruffle-upstream", $"inject bootstrap target={originalUri}");
                 body = InjectBootstrap(body, originalUri, contentType);
@@ -896,14 +950,14 @@ namespace WebBrowserApp
         {
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(originalUri);
             request.Method = context.Request.HttpMethod;
-            request.AllowAutoRedirect = true;
+            request.AllowAutoRedirect = false;
             request.AutomaticDecompression = DecompressionMethods.None;
             request.UserAgent = IeUserAgent;
             request.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
             request.Timeout = 15000;
             request.ReadWriteTimeout = 15000;
             request.Proxy = BuildUpstreamProxy(originalUri);
-            ApplyConfiguredCookies(request, originalUri);
+            ApplyConfiguredCookies(request, originalUri, context.Request.Headers["Cookie"]);
 
             foreach (string headerName in context.Request.Headers.AllKeys ?? Array.Empty<string>())
             {
@@ -956,6 +1010,7 @@ namespace WebBrowserApp
 
             using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
             {
+                CaptureResponseCookies(originalUri, response.Headers);
                 ProxyUpstreamResponse(context, response, originalUri);
             }
         }
@@ -971,10 +1026,16 @@ namespace WebBrowserApp
             }
 
             string contentType = response.ContentType ?? "application/octet-stream";
+            bool isRedirect = IsRedirectStatusCode(response.StatusCode);
+            string redirectTarget = GetRedirectTarget(response, originalUri);
             RuntimeDiagnostics.Write(
                 contentType.IndexOf("application/x-amf", StringComparison.OrdinalIgnoreCase) >= 0 ? "ruffle-amf" : "ruffle-upstream",
                 $"response status={(int)response.StatusCode} type={contentType} bytes={body.Length} target={originalUri}");
-            if (IsHtmlContentType(contentType) && ShouldInjectBootstrapForHtml(originalUri, body))
+            if (isRedirect)
+            {
+                RuntimeDiagnostics.Write("ruffle-redirect", $"status={(int)response.StatusCode} source={originalUri} target={redirectTarget}");
+            }
+            if (!isRedirect && IsHtmlContentType(contentType) && ShouldInjectBootstrapForHtml(originalUri, body))
             {
                 RuntimeDiagnostics.Write("ruffle-upstream", $"inject bootstrap target={originalUri}");
                 body = InjectBootstrap(body, originalUri, contentType);
@@ -1042,12 +1103,49 @@ namespace WebBrowserApp
             return new WebProxy(proxyUri);
         }
 
-        private void ApplyConfiguredCookies(HttpWebRequest request, Uri originalUri)
+        private static bool IsRedirectStatusCode(HttpStatusCode statusCode)
         {
-            string cookieHeader = FindCookieHeader(originalUri);
+            int value = (int)statusCode;
+            return value >= 300 && value < 400;
+        }
+
+        private static string GetRedirectTarget(HttpWebResponse response, Uri originalUri)
+        {
+            if (response == null)
+            {
+                return string.Empty;
+            }
+
+            string location = response.Headers?["Location"] ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(location))
+            {
+                return string.Empty;
+            }
+
+            if (Uri.TryCreate(location, UriKind.Absolute, out Uri absolute))
+            {
+                return absolute.AbsoluteUri;
+            }
+
+            if (originalUri != null && Uri.TryCreate(originalUri, location, out Uri relative))
+            {
+                return relative.AbsoluteUri;
+            }
+
+            return location;
+        }
+
+        private void ApplyConfiguredCookies(HttpWebRequest request, Uri originalUri, string runtimeCookieHeader)
+        {
+            string cookieHeader = MergeCookieHeaders(FindCookieHeader(originalUri), runtimeCookieHeader);
             if (string.IsNullOrWhiteSpace(cookieHeader))
             {
                 return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtimeCookieHeader))
+            {
+                RememberCookieHeader(originalUri, runtimeCookieHeader);
             }
 
             var container = new CookieContainer();
@@ -1081,6 +1179,49 @@ namespace WebBrowserApp
             RuntimeDiagnostics.Write("ruffle-cookie", $"attached cookies host={originalUri.Host} headerLength={cookieHeader.Length}");
         }
 
+        private void CaptureResponseCookies(Uri originalUri, WebHeaderCollection headers)
+        {
+            if (originalUri == null || headers == null)
+            {
+                return;
+            }
+
+            string[] setCookieValues = headers.GetValues("Set-Cookie");
+            if (setCookieValues == null || setCookieValues.Length == 0)
+            {
+                return;
+            }
+
+            string merged = string.Join("; ", setCookieValues
+                .Select(ExtractCookiePair)
+                .Where(value => !string.IsNullOrWhiteSpace(value)));
+            if (string.IsNullOrWhiteSpace(merged))
+            {
+                return;
+            }
+
+            RememberCookieHeader(originalUri, merged);
+            RuntimeDiagnostics.Write("ruffle-cookie", $"captured response cookies host={originalUri.Host} count={setCookieValues.Length}");
+        }
+
+        private void RememberCookieHeader(Uri originalUri, string cookieHeader)
+        {
+            if (originalUri == null || string.IsNullOrWhiteSpace(originalUri.Host) || string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                return;
+            }
+
+            string mergedValue;
+            lock (_stateLock)
+            {
+                _domainCookies.TryGetValue(originalUri.Host, out string existingValue);
+                mergedValue = MergeCookieHeaders(existingValue, cookieHeader);
+                _domainCookies[originalUri.Host] = mergedValue;
+            }
+
+            RuntimeDiagnostics.Write("ruffle-cookie", $"remembered cookies host={originalUri.Host} headerLength={mergedValue.Length}");
+        }
+
         private string FindCookieHeader(Uri originalUri)
         {
             if (originalUri == null || string.IsNullOrWhiteSpace(originalUri.Host))
@@ -1106,6 +1247,73 @@ namespace WebBrowserApp
             }
 
             return string.Empty;
+        }
+
+        private static string MergeCookieHeaders(string firstHeader, string secondHeader)
+        {
+            var cookieMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            AddCookieHeaderToMap(cookieMap, firstHeader);
+            AddCookieHeaderToMap(cookieMap, secondHeader);
+
+            return string.Join("; ", cookieMap.Select(entry => entry.Key + "=" + entry.Value));
+        }
+
+        private static void AddCookieHeaderToMap(IDictionary<string, string> cookieMap, string cookieHeader)
+        {
+            if (cookieMap == null || string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                return;
+            }
+
+            foreach (string segment in cookieHeader.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string cookiePair = ExtractCookiePair(segment);
+                if (string.IsNullOrWhiteSpace(cookiePair))
+                {
+                    continue;
+                }
+
+                int equalsIndex = cookiePair.IndexOf('=');
+                if (equalsIndex <= 0)
+                {
+                    continue;
+                }
+
+                string name = cookiePair.Substring(0, equalsIndex).Trim();
+                string value = cookiePair.Substring(equalsIndex + 1).Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                cookieMap[name] = value;
+            }
+        }
+
+        private static string ExtractCookiePair(string rawCookieValue)
+        {
+            if (string.IsNullOrWhiteSpace(rawCookieValue))
+            {
+                return string.Empty;
+            }
+
+            string firstSegment = rawCookieValue.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(segment => segment.Trim())
+                .FirstOrDefault(segment => segment.Contains("="));
+            if (string.IsNullOrWhiteSpace(firstSegment))
+            {
+                return string.Empty;
+            }
+
+            int equalsIndex = firstSegment.IndexOf('=');
+            if (equalsIndex <= 0)
+            {
+                return string.Empty;
+            }
+
+            string name = firstSegment.Substring(0, equalsIndex).Trim();
+            string value = firstSegment.Substring(equalsIndex + 1).Trim();
+            return string.IsNullOrWhiteSpace(name) ? string.Empty : name + "=" + value;
         }
 
         private string NormalizeForwardedHeaderValue(string headerName, string headerValue)
@@ -1186,7 +1394,7 @@ namespace WebBrowserApp
             string bootstrapTag = viewportTag
                 + $"<script>{BuildRuffleConfigScript()}</script>"
                 + $"<script>{BuildPageCompatScript(injectLegacyViewport)}</script>"
-                + $"<script src=\"{AssetPrefix}bootstrap.windows-heavy.bak.js\"></script>";
+                + $"<script src=\"{AssetPrefix}bootstrap.js\"></script>";
             if (normalizedHtml.IndexOf(bootstrapTag, StringComparison.Ordinal) >= 0)
             {
                 return Encoding.UTF8.GetBytes(normalizedHtml);
@@ -1281,12 +1489,18 @@ namespace WebBrowserApp
                 + "html,body{margin:0;padding:0;min-height:100%;background:#ffffff;overflow:auto;font-family:'Microsoft YaHei UI','PingFang SC','Noto Sans CJK SC',sans-serif;}"
                 + "body{display:flex;justify-content:center;align-items:flex-start;}"
                 + ".page{width:100%;display:flex;justify-content:center;padding:0;box-sizing:border-box;}"
-                + ".game-container{position:relative;width:760px;height:535px;min-height:535px;max-height:535px;overflow:hidden;flex:0 0 auto;background:#000;}"
-                + ".game-frame{display:block;width:760px;height:535px;min-height:535px;max-height:535px;}"
+                + ".game-container{position:relative;width:760px;min-width:760px;max-width:760px;height:535px;min-height:535px;max-height:535px;overflow:hidden;flex:0 0 auto;background:#000;}"
+                + ".game-frame{display:block;width:760px;min-width:760px;max-width:760px;height:535px;min-height:535px;max-height:535px;}"
                 + "</style>"
                 + $"<script>{BuildRuffleConfigScript()}</script>"
                 + $"<script>{BuildPageCompatScript(false)}</script>"
-                + $"<script src=\"{AssetPrefix}bootstrap.windows-heavy.bak.js\"></script>"
+                + "<script>try{console.log('[pvzol-inline] wrapped-main-begin',JSON.stringify({page:'"
+                + JavaScriptEscape(originalUri.AbsoluteUri)
+                + "',swf:'"
+                + JavaScriptEscape(shellInfo.SwfUrl)
+                + "'}));}catch(e){}</script>"
+                + $"<script src=\"{AssetPrefix}bootstrap.js\" onload=\"try{{console.log('[pvzol-inline] bootstrap-loaded');}}catch(e){{}}\" onerror=\"try{{console.error('[pvzol-inline] bootstrap-load-failed');}}catch(e){{}}\"></script>"
+                + "<script>window.addEventListener('load',function(){try{console.log('[pvzol-inline] wrapped-main-loaded',JSON.stringify({href:window.location.href,hasRuffle:!!(window.RufflePlayer&&window.RufflePlayer.newest)}));}catch(e){}});</script>"
                 + "</head><body>"
                 + "<div class='page'><div class='game-container'>"
                 + $"<embed class='game-frame' width='760' height='535' quality='high' src='{WebUtility.HtmlEncode(shellInfo.SwfUrl)}' flashvars='{WebUtility.HtmlEncode(flashVars)}'>"
@@ -1468,12 +1682,27 @@ namespace WebBrowserApp
             return IsSwfUrl(targetUri) || HasFlashIndicators(body);
         }
 
-        private bool TryBuildWrappedGameMainResponse(Uri targetUri, out RuffleResolvedResponse response)
+        private bool TryBuildWrappedGameMainResponse(Uri targetUri, IDictionary<string, string> requestHeaders, out RuffleResolvedResponse response)
         {
             response = null;
             if (!TryGetGameMainShellInfo(targetUri, out GameMainShellInfo shellInfo))
             {
                 return false;
+            }
+
+            if (IsYoukiaRuntimeMainHost(targetUri))
+            {
+                string runtimeCookieHeader = requestHeaders != null && requestHeaders.TryGetValue("Cookie", out string requestCookie)
+                    ? requestCookie
+                    : string.Empty;
+                string effectiveCookieHeader = MergeCookieHeaders(FindCookieHeader(targetUri), runtimeCookieHeader);
+                if (!HasRequiredYoukiaRuntimeCookies(effectiveCookieHeader))
+                {
+                    RuntimeDiagnostics.Write(
+                        "ruffle-shell",
+                        $"skip wrapped game page target={targetUri} reason=missing-strong-cookie cookieLength={(effectiveCookieHeader ?? string.Empty).Length}");
+                    return false;
+                }
             }
 
             RuntimeDiagnostics.Write(
@@ -1487,6 +1716,56 @@ namespace WebBrowserApp
                 Encoding.UTF8.GetBytes(BuildWrappedGameMainHtml(targetUri, shellInfo)),
                 BuildCorsHeaders());
             return true;
+        }
+
+        private static bool IsYoukiaRuntimeMainHost(Uri targetUri)
+        {
+            string host = targetUri?.Host ?? string.Empty;
+            const string suffix = ".youkia.pvz.youkia.com";
+            return host.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+                && host.Length > suffix.Length;
+        }
+
+        private static bool HasRequiredYoukiaRuntimeCookies(string cookieHeader)
+        {
+            if (string.IsNullOrWhiteSpace(cookieHeader))
+            {
+                return false;
+            }
+
+            bool hasPhpSessionId = false;
+            bool hasPvzYoukiaNew1 = false;
+            foreach (string segment in cookieHeader.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string cookiePair = ExtractCookiePair(segment);
+                if (string.IsNullOrWhiteSpace(cookiePair))
+                {
+                    continue;
+                }
+
+                int equalsIndex = cookiePair.IndexOf('=');
+                if (equalsIndex <= 0)
+                {
+                    continue;
+                }
+
+                string name = cookiePair.Substring(0, equalsIndex).Trim();
+                if (string.Equals(name, "PHPSESSID", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasPhpSessionId = true;
+                }
+                else if (string.Equals(name, "pvz_youkia_new1", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasPvzYoukiaNew1 = true;
+                }
+
+                if (hasPhpSessionId && hasPvzYoukiaNew1)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool TryGetGameMainShellInfo(Uri targetUri, out GameMainShellInfo shellInfo)

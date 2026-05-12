@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -44,6 +45,8 @@ namespace WebBrowserApp
 
         public event EventHandler<RuffleNavigationCompletedEventArgs> NavigationCompleted;
 
+        public event EventHandler<RuffleNewWindowRequestedEventArgs> NewWindowRequested;
+
         public async Task InitializeAsync()
         {
             if (_view.CoreWebView2 != null)
@@ -54,6 +57,7 @@ namespace WebBrowserApp
             await _view.EnsureCoreWebView2Async().ConfigureAwait(true);
             AttachRequestFilter();
             await AttachConsoleLoggingAsync().ConfigureAwait(true);
+            AttachWindowInterception();
             _view.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             _view.CoreWebView2.Settings.AreDevToolsEnabled = false;
             _view.CoreWebView2.Settings.IsStatusBarEnabled = false;
@@ -134,7 +138,7 @@ namespace WebBrowserApp
             {
                 CoreWebView2CookieManager cookieManager = _view.CoreWebView2.CookieManager;
                 int applied = 0;
-                foreach (string segment in cookieHeader.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                foreach (string segment in SplitCookieSegments(cookieHeader))
                 {
                     string trimmed = segment.Trim();
                     int equalsIndex = trimmed.IndexOf('=');
@@ -150,12 +154,15 @@ namespace WebBrowserApp
                         continue;
                     }
 
-                    CoreWebView2Cookie cookie = cookieManager.CreateCookie(name, value, targetUri.Host, "/");
-                    cookie.IsHttpOnly = false;
-                    cookie.IsSecure = string.Equals(targetUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
-                    cookie.SameSite = CoreWebView2CookieSameSiteKind.None;
-                    cookieManager.AddOrUpdateCookie(cookie);
-                    applied += 1;
+                    foreach (string domain in BuildCookieDomains(targetUri.Host))
+                    {
+                        CoreWebView2Cookie cookie = cookieManager.CreateCookie(name, value, domain, "/");
+                        cookie.IsHttpOnly = false;
+                        cookie.IsSecure = string.Equals(targetUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase);
+                        cookie.SameSite = CoreWebView2CookieSameSiteKind.None;
+                        cookieManager.AddOrUpdateCookie(cookie);
+                        applied += 1;
+                    }
                 }
 
                 RuntimeDiagnostics.Write("ruffle-cookie", $"webview2 cookies applied host={targetUri.Host} count={applied}");
@@ -175,9 +182,49 @@ namespace WebBrowserApp
             {
                 _view.CoreWebView2.WebMessageReceived -= View_WebMessageReceived;
                 _view.CoreWebView2.WebResourceRequested -= View_WebResourceRequested;
+                _view.CoreWebView2.NewWindowRequested -= View_NewWindowRequested;
             }
 
             _view.Dispose();
+        }
+
+        public async Task<string> GetCookieHeaderAsync(params Uri[] candidateUris)
+        {
+            if (_view.CoreWebView2 == null)
+            {
+                return string.Empty;
+            }
+
+            var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            IEnumerable<Uri> targets = (candidateUris ?? Array.Empty<Uri>())
+                .Where(uri => uri != null)
+                .GroupBy(uri => uri.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First());
+
+            foreach (Uri candidate in targets)
+            {
+                try
+                {
+                    List<CoreWebView2Cookie> cookies = await _view.CoreWebView2.CookieManager
+                        .GetCookiesAsync(candidate.AbsoluteUri)
+                        .ConfigureAwait(true);
+                    foreach (CoreWebView2Cookie cookie in cookies)
+                    {
+                        if (cookie == null || string.IsNullOrWhiteSpace(cookie.Name))
+                        {
+                            continue;
+                        }
+
+                        merged[cookie.Name] = $"{cookie.Name}={cookie.Value ?? string.Empty}";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    RuntimeDiagnostics.Write("ruffle-cookie", $"read cookies failed uri={candidate} error={ex.Message}");
+                }
+            }
+
+            return string.Join("; ", merged.Values);
         }
 
         private void View_SourceChanged(object sender, CoreWebView2SourceChangedEventArgs e)
@@ -236,8 +283,55 @@ namespace WebBrowserApp
                 + "console[level]=function(){send(level,arguments);if(typeof original==='function'){return original.apply(console,arguments);}};"
                 + "});"
                 + "})();").ConfigureAwait(true);
+            await _view.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
+                "(function(){"
+                + "if(window.__pvzolNavHookInstalled){return;}"
+                + "window.__pvzolNavHookInstalled=true;"
+                + "function nav(url){try{if(url){window.location.href=String(url);return true;}}catch(e){}return false;}"
+                + "window.open=function(url){nav(url);return window;};"
+                + "if(window.showModalDialog){window.showModalDialog=function(url){nav(url);return null;};}"
+                + "if(window.showModelessDialog){window.showModelessDialog=function(url){nav(url);return null;};}"
+                + "function patchTargets(){"
+                + "var anchors=document.getElementsByTagName('a');"
+                + "for(var i=0;i<anchors.length;i++){try{if(anchors[i].target){anchors[i].target='_self';}}catch(e){}}"
+                + "var forms=document.getElementsByTagName('form');"
+                + "for(var j=0;j<forms.length;j++){try{if(forms[j].target){forms[j].target='_self';}}catch(e){}}"
+                + "}"
+                + "patchTargets();"
+                + "if(window.setInterval){window.setInterval(patchTargets,1000);}"
+                + "if(document.addEventListener){document.addEventListener('click',function(evt){"
+                + "var el=evt&&evt.target?evt.target:null;"
+                + "while(el&&el.tagName&&el.tagName.toLowerCase()!=='a'){el=el.parentElement;}"
+                + "if(el&&el.href){try{el.target='_self';}catch(e){}}"
+                + "},true);}"
+                + "})();").ConfigureAwait(true);
             _consoleAttached = true;
             RuntimeDiagnostics.Write("ruffle", "webview console logging attached");
+        }
+
+        private void AttachWindowInterception()
+        {
+            if (_view.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            _view.CoreWebView2.NewWindowRequested -= View_NewWindowRequested;
+            _view.CoreWebView2.NewWindowRequested += View_NewWindowRequested;
+        }
+
+        private void View_NewWindowRequested(object sender, CoreWebView2NewWindowRequestedEventArgs e)
+        {
+            e.Handled = true;
+            if (Uri.TryCreate(e.Uri, UriKind.Absolute, out Uri targetUri))
+            {
+                RuntimeDiagnostics.Write("ruffle-nav", $"intercepted new window url={targetUri}");
+                NewWindowRequested?.Invoke(this, new RuffleNewWindowRequestedEventArgs(targetUri));
+            }
+            else
+            {
+                RuntimeDiagnostics.Write("ruffle-nav", $"intercepted new window with invalid uri={e.Uri}");
+            }
         }
 
         private void View_WebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -298,10 +392,43 @@ namespace WebBrowserApp
                     return;
                 }
 
+                string method = e.Request.Method ?? "GET";
+                string requestPath = requestUri.AbsolutePath ?? "/";
+                bool isManagedPath =
+                    requestPath.StartsWith("/__proxy__/", StringComparison.OrdinalIgnoreCase)
+                    || requestPath.StartsWith("/__player__/", StringComparison.OrdinalIgnoreCase)
+                    || requestPath.StartsWith("/__ruffle__/", StringComparison.OrdinalIgnoreCase);
+                bool isAmfCandidate = IsAmfCandidateRequest(requestUri, method, e.Request.Headers);
+                if (!isManagedPath && string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && !isAmfCandidate)
+                {
+                    RuntimeDiagnostics.Write("ruffle-amf", $"bypass direct post url={requestUri}");
+                    return;
+                }
+
                 Dictionary<string, string> headers = ReadRequestHeaders(e.Request.Headers);
-                byte[] requestBody = await ReadRequestBodyAsync(e.Request.Content).ConfigureAwait(true);
+                byte[] requestBody = null;
+                if (isManagedPath || !string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    requestBody = await ReadRequestBodyAsync(e.Request.Content).ConfigureAwait(true);
+                }
+
+                if (!isManagedPath && isAmfCandidate)
+                {
+                    string amfContentType = headers.TryGetValue("Content-Type", out string contentTypeValue)
+                        ? contentTypeValue
+                        : string.Empty;
+                    RuntimeDiagnostics.Write(
+                        "ruffle-amf",
+                        $"direct post capture url={requestUri} bodyBytes={(requestBody == null ? 0 : requestBody.Length)} contentType={amfContentType}");
+                    if (requestBody == null || requestBody.Length == 0)
+                    {
+                        RuntimeDiagnostics.Write("ruffle-amf", $"fallback to native direct post because body is empty url={requestUri}");
+                        return;
+                    }
+                }
+
                 RuffleLocalProxy.RuffleResolvedResponse response =
-                    await _proxy.TryHandleRequestAsync(requestUri, e.Request.Method, headers, requestBody).ConfigureAwait(true);
+                    await _proxy.TryHandleRequestAsync(requestUri, method, headers, requestBody).ConfigureAwait(true);
                 if (response == null)
                 {
                     return;
@@ -322,6 +449,33 @@ namespace WebBrowserApp
             {
                 deferral.Complete();
             }
+        }
+
+        private static bool IsAmfCandidateRequest(Uri requestUri, string method, CoreWebView2HttpRequestHeaders headers)
+        {
+            if (!string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) || requestUri == null)
+            {
+                return false;
+            }
+
+            string path = requestUri.AbsolutePath ?? string.Empty;
+            if (path.IndexOf("/pvz/amf/", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            if (headers == null)
+            {
+                return false;
+            }
+
+            if (!headers.Contains("Content-Type"))
+            {
+                return false;
+            }
+
+            return headers.GetHeader("Content-Type")
+                .IndexOf("application/x-amf", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private void ApplyPendingCookies()
@@ -451,6 +605,42 @@ namespace WebBrowserApp
                 .Replace("\\n", "\n")
                 .Replace("\\r", "\r")
                 .Replace("\\t", "\t");
+        }
+
+        private static IEnumerable<string> SplitCookieSegments(string cookieHeader)
+        {
+            return (cookieHeader ?? string.Empty)
+                .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => value.Trim())
+                .Where(value => value.Contains("="));
+        }
+
+        private static IEnumerable<string> BuildCookieDomains(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                yield break;
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (seen.Add(host))
+            {
+                yield return host;
+            }
+
+            string normalizedHost = host.Trim().TrimStart('.');
+            if (normalizedHost.EndsWith(".youkia.com", StringComparison.OrdinalIgnoreCase))
+            {
+                if (seen.Add(".youkia.com"))
+                {
+                    yield return ".youkia.com";
+                }
+
+                if (seen.Add("youkia.com"))
+                {
+                    yield return "youkia.com";
+                }
+            }
         }
     }
 }

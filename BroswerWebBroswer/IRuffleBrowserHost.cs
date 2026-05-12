@@ -30,6 +30,16 @@ namespace WebBrowserApp
         internal string WebErrorStatus { get; }
     }
 
+    internal sealed class RuffleNewWindowRequestedEventArgs : EventArgs
+    {
+        internal RuffleNewWindowRequestedEventArgs(Uri targetUri)
+        {
+            TargetUri = targetUri;
+        }
+
+        internal Uri TargetUri { get; }
+    }
+
     internal interface IRuffleBrowserHost : IDisposable
     {
         Control ViewControl { get; }
@@ -39,6 +49,8 @@ namespace WebBrowserApp
         event EventHandler<RuffleSourceChangedEventArgs> SourceChanged;
 
         event EventHandler<RuffleNavigationCompletedEventArgs> NavigationCompleted;
+
+        event EventHandler<RuffleNewWindowRequestedEventArgs> NewWindowRequested;
 
         Task InitializeAsync();
 
@@ -51,5 +63,7 @@ namespace WebBrowserApp
         void ClearCookies();
 
         void ApplyCookies(Uri targetUri, string cookieHeader);
+
+        Task<string> GetCookieHeaderAsync(params Uri[] candidateUris);
     }
 }
